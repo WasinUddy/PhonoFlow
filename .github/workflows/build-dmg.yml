@@ -22,10 +22,7 @@ jobs:
           xcodebuild archive \
             -scheme PhonoFlow \
             -configuration Release \
-            -archivePath ${{ runner.temp }}/PhonoFlow.xcarchive \
-            CODE_SIGN_IDENTITY="" \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGNING_ALLOWED=NO
+            -archivePath ${{ runner.temp }}/PhonoFlow.xcarchive
 
       - name: Export app
         run: |
@@ -33,6 +30,10 @@ jobs:
             -archivePath ${{ runner.temp }}/PhonoFlow.xcarchive \
             -exportPath ${{ runner.temp }}/export \
             -exportOptionsPlist .github/workflows/ExportOptions.plist
+
+      - name: Ad-hoc code sign
+        run: |
+          codesign --force --deep --sign - "${{ runner.temp }}/export/PhonoFlow.app"
 
       - name: Create DMG
         run: |

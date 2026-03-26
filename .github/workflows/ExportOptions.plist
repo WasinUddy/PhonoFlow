@@ -5,7 +5,7 @@
 	<key>method</key>
 	<string>mac-application</string>
 	<key>signingStyle</key>
-	<string>manual</string>
+	<string>automatic</string>
 	<key>stripSwiftSymbols</key>
 	<true/>
 	<key>compileBitcode</key>
