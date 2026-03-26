@@ -14,7 +14,7 @@ A professional menu bar app for monitoring and streaming audio from your turntab
 
 ## System Requirements
 
-- macOS 14.0 (Sonoma) or later
+- macOS 15.0 (Sequoia) or later
 - Apple Silicon or Intel Mac
 - Microphone permission (automatically requested)
 
