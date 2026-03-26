@@ -5,7 +5,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-15  # Apple Silicon runner with macOS Sequoia and Xcode 16+
+    runs-on: macos-26  # Apple Silicon runner with macOS Tahoe and Xcode 17+ for Liquidglass design
 
     steps:
       - name: Checkout code
