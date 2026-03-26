@@ -33,6 +33,9 @@ struct ContentView: View {
                 audioManager.requestMicrophonePermission()
             }
 
+            // Enable metering based on mode
+            audioMonitor.isMeteringEnabled = settings.isProMode
+
             if audioManager.microphonePermissionGranted {
                 audioManager.refreshDevices()
                 if !audioMonitor.isMonitoring,
@@ -66,6 +69,13 @@ struct ContentView: View {
         }
         .onChange(of: audioMonitor.gain) {
             audioMonitor.updatePassthroughVolume()
+        }
+        .onChange(of: settings.isProMode) { _, newValue in
+            audioMonitor.isMeteringEnabled = newValue
+            if newValue {
+                // Start UI updates when switching to pro mode
+                audioMonitor.startUIUpdateTimer()
+            }
         }
     }
 

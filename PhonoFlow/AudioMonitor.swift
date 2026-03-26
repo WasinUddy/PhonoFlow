@@ -31,6 +31,12 @@ class AudioMonitor {
     private var captureSampleRate: Double = 44100
     private var audioFormat = AudioStreamBasicDescription()
 
+    var isMeteringEnabled: Bool = false {
+        didSet {
+            sharedState.setMeteringEnabled(isMeteringEnabled)
+        }
+    }
+
     func startMonitoring(deviceID: AudioDeviceID, outputDeviceID: AudioDeviceID?) {
         stopMonitoring()
 
@@ -46,6 +52,7 @@ class AudioMonitor {
         // Initialize gain in shared state
         sharedState.setGain(gain)
         sharedState.setVolume(isPassthroughEnabled ? gain : 0)
+        sharedState.setMeteringEnabled(isMeteringEnabled)
 
         // Start the audio units
         AudioOutputUnitStart(inputUnit!)
@@ -55,8 +62,10 @@ class AudioMonitor {
 
         isMonitoring = true
 
-        // Start periodic UI updates
-        startUIUpdateTimer()
+        // Start periodic UI updates only if metering is enabled
+        if isMeteringEnabled {
+            startUIUpdateTimer()
+        }
     }
 
     func stopMonitoring() {
@@ -276,7 +285,7 @@ class AudioMonitor {
 
     private var uiUpdateTimer: Timer?
 
-    private func startUIUpdateTimer() {
+    func startUIUpdateTimer() {
         // Reduce from 30Hz to 20Hz to save CPU
         uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
@@ -301,6 +310,7 @@ private class SharedAudioState {
     private var _smoothedPeak: Float = 0
     private var _volume: Float = 0
     private var _gain: Float = 1.0
+    private var _meteringEnabled: Bool = false
     private var bufferCounter = 0
     var streamServerPtr: UnsafeMutableRawPointer?
     var inputUnit: AudioUnit?
@@ -333,6 +343,19 @@ private class SharedAudioState {
         os_unfair_lock_lock(&lock)
         _gain = gain
         os_unfair_lock_unlock(&lock)
+    }
+
+    func setMeteringEnabled(_ enabled: Bool) {
+        os_unfair_lock_lock(&lock)
+        _meteringEnabled = enabled
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func isMeteringEnabled() -> Bool {
+        os_unfair_lock_lock(&lock)
+        let enabled = _meteringEnabled
+        os_unfair_lock_unlock(&lock)
+        return enabled
     }
 
     func getPeakLevel() -> Float {
@@ -502,12 +525,12 @@ private func inputRenderCallback(
     // Get current gain for processing
     let currentGain = state.getGain()
 
-    // Calculate RMS on mono mix
-    var rms: Float = 0
-    vDSP_rmsqv(monoBuffer, 1, &rms, vDSP_Length(frameCount))
-
-    // Update peak on this thread with current gain (real-time safe)
-    state.updatePeak(rms: rms, gain: currentGain)
+    // Only calculate RMS and update meter if metering is enabled
+    if state.isMeteringEnabled() {
+        var rms: Float = 0
+        vDSP_rmsqv(monoBuffer, 1, &rms, vDSP_Length(frameCount))
+        state.updatePeak(rms: rms, gain: currentGain)
+    }
 
     // Apply gain for passthrough and streaming (reuse gainedBuffer)
     if currentGain != 1.0 {
