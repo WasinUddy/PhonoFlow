@@ -1,0 +1,60 @@
+name: Build DMG
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Select Xcode version
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Build PhonoFlow
+        run: |
+          xcodebuild archive \
+            -scheme PhonoFlow \
+            -configuration Release \
+            -archivePath ${{ runner.temp }}/PhonoFlow.xcarchive \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Export app
+        run: |
+          xcodebuild -exportArchive \
+            -archivePath ${{ runner.temp }}/PhonoFlow.xcarchive \
+            -exportPath ${{ runner.temp }}/export \
+            -exportOptionsPlist .github/workflows/ExportOptions.plist
+
+      - name: Create DMG
+        run: |
+          # Install create-dmg
+          brew install create-dmg
+
+          # Create DMG
+          create-dmg \
+            --volname "PhonoFlow" \
+            --volicon "${{ runner.temp }}/export/PhonoFlow.app/Contents/Resources/AppIcon.icns" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --icon "PhonoFlow.app" 200 190 \
+            --hide-extension "PhonoFlow.app" \
+            --app-drop-link 600 185 \
+            "${{ runner.temp }}/PhonoFlow.dmg" \
+            "${{ runner.temp }}/export/PhonoFlow.app"
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PhonoFlow-macOS-arm64
+          path: ${{ runner.temp }}/PhonoFlow.dmg
+          retention-days: 30
