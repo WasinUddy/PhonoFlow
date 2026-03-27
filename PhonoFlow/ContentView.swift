@@ -25,7 +25,7 @@ struct ContentView: View {
                 content(audioManager: $audioManager, audioMonitor: $audioMonitor)
             }
         }
-        .frame(width: 440)
+        .frame(width: 540)
         .onAppear {
             audioManager.updatePermissionStatus()
 
@@ -78,6 +78,11 @@ struct ContentView: View {
             if newValue {
                 // Start UI updates when switching to pro mode
                 audioMonitor.startUIUpdateTimer()
+            } else {
+                // Disable all Pro features when switching to basic mode
+                if audioMonitor.isStreamingEnabled {
+                    audioMonitor.stopStreaming()
+                }
             }
         }
     }
@@ -221,6 +226,10 @@ struct ContentView: View {
                     WaveformView(peakLevel: self.audioMonitor.peakLevel,
                                  gain: audioMonitor.gain,
                                  theme: theme)
+                }
+
+                sectionCard {
+                    EqualizerView(eqBands: audioMonitor.eqBands, theme: theme)
                 }
             }
 

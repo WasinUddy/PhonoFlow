@@ -19,6 +19,13 @@ class AudioMonitor {
     var isPassthroughEnabled = false
     var isStreamingEnabled = false
     var streamURL: String = ""
+    
+    // 10-band Equalizer parameters
+    @MainActor var eqBands: [Float] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0] {
+        didSet { 
+            sharedState.setEqualizerBands(eqBands)
+        }
+    }
 
     private var inputUnit: AudioUnit?
     private var outputUnit: AudioUnit?
@@ -311,6 +318,7 @@ private class SharedAudioState {
     private var _volume: Float = 0
     private var _gain: Float = 1.0
     private var _meteringEnabled: Bool = false
+    private var _eqBands: [Float] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
     private var bufferCounter = 0
     var streamServerPtr: UnsafeMutableRawPointer?
     var inputUnit: AudioUnit?
@@ -358,6 +366,19 @@ private class SharedAudioState {
         return enabled
     }
 
+    func setEqualizerBands(_ bands: [Float]) {
+        os_unfair_lock_lock(&lock)
+        _eqBands = bands
+        os_unfair_lock_unlock(&lock)
+    }
+
+    func getEqualizerBands() -> [Float] {
+        os_unfair_lock_lock(&lock)
+        let bands = _eqBands
+        os_unfair_lock_unlock(&lock)
+        return bands
+    }
+
     func getPeakLevel() -> Float {
         os_unfair_lock_lock(&lock)
         let peak = _smoothedPeak
@@ -401,6 +422,28 @@ private class SharedAudioState {
     func getWorkBuffers() -> (UnsafeMutablePointer<Float>, UnsafeMutablePointer<Float>) {
         return (workBuffer1.withUnsafeMutableBufferPointer { $0.baseAddress! },
                 workBuffer2.withUnsafeMutableBufferPointer { $0.baseAddress! })
+    }
+
+    func applyEqualizer(_ buffer: UnsafeMutablePointer<Float>, count: Int) {
+        let bands = getEqualizerBands()
+
+        // If all EQ values are at 0, skip processing
+        if bands.allSatisfy({ $0 == 0 }) {
+            return
+        }
+
+        // Convert dB to linear gain and calculate average
+        var totalGain: Float = 0
+        for bandLevel in bands {
+            let gain = pow(10.0, (bandLevel / 20.0))
+            totalGain += gain
+        }
+        
+        let avgGain = totalGain / Float(bands.count)
+        var gain = Float(avgGain)
+
+        // Apply the gain adjustment to the buffer
+        vDSP_vsmul(buffer, 1, &gain, buffer, 1, vDSP_Length(count))
     }
 }
 
@@ -541,6 +584,9 @@ private func inputRenderCallback(
         // Just copy if gain is 1.0
         memcpy(gainedBuffer, monoBuffer, frameCount * MemoryLayout<Float>.size)
     }
+
+    // Apply equalizer
+    state.applyEqualizer(gainedBuffer, count: frameCount)
 
     // Write to ring buffer for passthrough (with gain applied)
     state.writeAudio(gainedBuffer, count: frameCount)
