@@ -483,42 +483,43 @@ private func inputRenderCallback(
     // Use pre-allocated work buffers (no allocations!)
     let (monoBuffer, gainedBuffer) = state.getWorkBuffers()
 
-    // For stereo, render directly into mono buffer for first channel
-    var bufferList = AudioBufferList(
-        mNumberBuffers: UInt32(channelCount),
-        mBuffers: AudioBuffer(
-            mNumberChannels: 1,
-            mDataByteSize: byteSize,
-            mData: UnsafeMutableRawPointer(monoBuffer)
-        )
-    )
-
-    // Handle stereo by setting up buffer list manually
     if channelCount == 2 {
-        withUnsafeMutablePointer(to: &bufferList) { ptr in
-            let bufferListPtr = UnsafeMutableAudioBufferListPointer(ptr)
-            bufferListPtr[0] = AudioBuffer(
-                mNumberChannels: 1,
-                mDataByteSize: byteSize,
-                mData: UnsafeMutableRawPointer(monoBuffer)
-            )
-            bufferListPtr[1] = AudioBuffer(
+        // AudioBufferList only has inline storage for 1 AudioBuffer.
+        // Use a tuple to get contiguous stack memory for the second buffer,
+        // avoiding heap allocation in this real-time callback.
+        var stereoABL: (AudioBufferList, AudioBuffer) = (
+            AudioBufferList(
+                mNumberBuffers: 2,
+                mBuffers: AudioBuffer(
+                    mNumberChannels: 1,
+                    mDataByteSize: byteSize,
+                    mData: UnsafeMutableRawPointer(monoBuffer)
+                )
+            ),
+            AudioBuffer(
                 mNumberChannels: 1,
                 mDataByteSize: byteSize,
                 mData: UnsafeMutableRawPointer(gainedBuffer)
             )
-
-            // Pull audio from the input
-            let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ptr)
+        )
+        withUnsafeMutablePointer(to: &stereoABL) { ptr in
+            let ablPtr = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: AudioBufferList.self)
+            let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
             guard status == noErr else { return }
 
-            // Average the two channels into monoBuffer
             vDSP_vadd(monoBuffer, 1, gainedBuffer, 1, monoBuffer, 1, vDSP_Length(frameCount))
             var divisor: Float = 2.0
             vDSP_vsdiv(monoBuffer, 1, &divisor, monoBuffer, 1, vDSP_Length(frameCount))
         }
     } else {
-        // Mono input
+        var bufferList = AudioBufferList(
+            mNumberBuffers: 1,
+            mBuffers: AudioBuffer(
+                mNumberChannels: 1,
+                mDataByteSize: byteSize,
+                mData: UnsafeMutableRawPointer(monoBuffer)
+            )
+        )
         AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, &bufferList)
     }
 
