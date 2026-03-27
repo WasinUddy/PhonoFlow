@@ -6,6 +6,7 @@
 //
 
 import AppKit
+import Combine
 import CoreAudio
 import SwiftUI
 
@@ -281,33 +282,8 @@ struct ContentView: View {
                            selection: Binding<AudioDeviceID?>,
                            devices: [AudioDevice],
                            disconnectedName: String?) -> some View {
-        HStack(spacing: 6) {
-            Image(systemName: icon)
-                .font(.system(size: 10))
-                .foregroundStyle(disconnectedName != nil
-                                 ? AppColors.closeRed.opacity(0.8)
-                                 : .primary.opacity(0.35))
-
-            if let name = disconnectedName {
-                HStack(spacing: 4) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.system(size: 8))
-                    Text(name)
-                        .lineLimit(1)
-                }
-                .font(.system(size: 11, weight: .medium))
-                .foregroundStyle(AppColors.closeRed)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            } else {
-                Picker("Device", selection: selection) {
-                    Text("None").tag(nil as AudioDeviceID?)
-                    ForEach(devices) { device in
-                        Text(device.name).tag(device.id as AudioDeviceID?)
-                    }
-                }
-                .labelsHidden()
-            }
-        }
+        DeviceRowView(icon: icon, selection: selection, devices: devices, 
+                      disconnectedName: disconnectedName, audioManager: audioManager)
     }
 
     @ViewBuilder
@@ -360,4 +336,61 @@ struct ContentView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 6))
     }
 
+}
+
+// MARK: - Device Row View
+
+struct DeviceRowView: View {
+    let icon: String
+    @Binding var selection: AudioDeviceID?
+    let devices: [AudioDevice]
+    let disconnectedName: String?
+    let audioManager: AudioDeviceManager
+    
+    @State private var isPickerFocused = false
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 10))
+                .foregroundStyle(disconnectedName != nil
+                                 ? AppColors.closeRed.opacity(0.8)
+                                 : .primary.opacity(0.35))
+
+            VStack(spacing: 4) {
+                if let name = disconnectedName {
+                    HStack(spacing: 4) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 8))
+                        Text(name)
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(AppColors.closeRed)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                HStack {
+                    Picker("Device", selection: $selection) {
+                        Text("None").tag(nil as AudioDeviceID?)
+                        ForEach(devices) { device in
+                            Text(device.name).tag(device.id as AudioDeviceID?)
+                        }
+                    }
+                    .labelsHidden()
+                    
+                    Button(action: {
+                        audioManager.refreshDevices()
+                    }) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh device list")
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
 }
