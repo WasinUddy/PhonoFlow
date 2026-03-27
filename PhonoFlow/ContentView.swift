@@ -56,6 +56,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: audioManager.selectedInputDeviceID) { _, newValue in
+            audioManager.refreshDevices()
             if let deviceID = newValue, audioManager.isInputAvailable {
                 audioMonitor.startMonitoring(deviceID: deviceID,
                                              outputDeviceID: audioManager.selectedOutputDeviceID)
@@ -64,6 +65,7 @@ struct ContentView: View {
             }
         }
         .onChange(of: audioManager.selectedOutputDeviceID) { _, newValue in
+            audioManager.refreshDevices()
             if let deviceID = newValue {
                 audioMonitor.updatePassthroughOutput(deviceID: deviceID)
             }
@@ -346,8 +348,6 @@ struct DeviceRowView: View {
     let devices: [AudioDevice]
     let disconnectedName: String?
     let audioManager: AudioDeviceManager
-    
-    @State private var isPickerFocused = false
 
     var body: some View {
         HStack(spacing: 6) {
@@ -357,38 +357,30 @@ struct DeviceRowView: View {
                                  ? AppColors.closeRed.opacity(0.8)
                                  : .primary.opacity(0.35))
 
-            VStack(spacing: 4) {
-                if let name = disconnectedName {
-                    HStack(spacing: 4) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.system(size: 8))
+            HStack {
+                Picker("Device", selection: $selection) {
+                    if let name = disconnectedName {
                         Text(name)
-                            .lineLimit(1)
-                    }
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(AppColors.closeRed)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-
-                HStack {
-                    Picker("Device", selection: $selection) {
+                            .foregroundStyle(AppColors.closeRed)
+                            .tag(nil as AudioDeviceID?)
+                    } else {
                         Text("None").tag(nil as AudioDeviceID?)
-                        ForEach(devices) { device in
-                            Text(device.name).tag(device.id as AudioDeviceID?)
-                        }
                     }
-                    .labelsHidden()
-                    
-                    Button(action: {
-                        audioManager.refreshDevices()
-                    }) {
-                        Image(systemName: "arrow.clockwise")
-                            .font(.system(size: 9))
-                            .foregroundStyle(.secondary)
+                    ForEach(devices) { device in
+                        Text(device.name).tag(device.id as AudioDeviceID?)
                     }
-                    .buttonStyle(.plain)
-                    .help("Refresh device list")
                 }
+                .labelsHidden()
+                
+                Button(action: {
+                    audioManager.refreshDevices()
+                }) {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Refresh device list")
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
