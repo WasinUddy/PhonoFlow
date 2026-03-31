@@ -2,7 +2,7 @@
 //  AudioMonitor.swift
 //  PhonoFlow
 //
-//  Rewritten with Core Audio for maximum stability and real-time performance
+//  Stereo audio monitoring with DC offset removal and clip protection
 //
 
 import Accelerate
@@ -32,11 +32,9 @@ class AudioMonitor {
     private var inputDeviceID: AudioDeviceID = 0
     private var outputDeviceID: AudioDeviceID = 0
 
-    // Atomic state shared between real-time thread and main thread
     private let sharedState = SharedAudioState()
     private let streamServer = AudioStreamServer()
     private var captureSampleRate: Double = 44100
-    private var audioFormat = AudioStreamBasicDescription()
 
     var isMeteringEnabled: Bool = false {
         didSet {
@@ -56,12 +54,10 @@ class AudioMonitor {
             return
         }
 
-        // Initialize gain in shared state
         sharedState.setGain(gain)
         sharedState.setVolume(isPassthroughEnabled ? gain : 0)
         sharedState.setMeteringEnabled(isMeteringEnabled)
 
-        // Start the audio units
         AudioOutputUnitStart(inputUnit!)
         if isPassthroughEnabled {
             AudioOutputUnitStart(outputUnit!)
@@ -69,7 +65,6 @@ class AudioMonitor {
 
         isMonitoring = true
 
-        // Start periodic UI updates only if metering is enabled
         if isMeteringEnabled {
             startUIUpdateTimer()
         }
@@ -118,7 +113,6 @@ class AudioMonitor {
         guard isMonitoring else { return }
         outputDeviceID = deviceID
 
-        // Recreate output unit with new device
         if let unit = outputUnit {
             AudioOutputUnitStop(unit)
             AudioComponentInstanceDispose(unit)
@@ -131,7 +125,7 @@ class AudioMonitor {
 
     func updatePassthroughVolume() {
         sharedState.setVolume(isPassthroughEnabled ? gain : 0)
-        sharedState.setGain(gain)  // Update gain for metering
+        sharedState.setGain(gain)
     }
 
     // MARK: - Streaming
@@ -173,7 +167,6 @@ class AudioMonitor {
         guard AudioComponentInstanceNew(component, &unit) == noErr,
               let unit = unit else { return false }
 
-        // Enable input, disable output
         var enableIO: UInt32 = 1
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
                            kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size))
@@ -181,22 +174,20 @@ class AudioMonitor {
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
                            kAudioUnitScope_Output, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size))
 
-        // Set device
         var deviceIDVar = deviceID
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                            kAudioUnitScope_Global, 0, &deviceIDVar, UInt32(MemoryLayout<AudioDeviceID>.size))
 
-        // Get input format
+        optimizeDeviceBufferSize(deviceID)
+
         var asbd = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
                            kAudioUnitScope_Input, 1, &asbd, &size)
 
-        // Store sample rate and channel count
         captureSampleRate = asbd.mSampleRate
         let channelCount = asbd.mChannelsPerFrame
 
-        // Set format to Float32 (keep original channel count)
         asbd.mFormatID = kAudioFormatLinearPCM
         asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved
         asbd.mBitsPerChannel = 32
@@ -208,15 +199,10 @@ class AudioMonitor {
         AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
                            kAudioUnitScope_Output, 1, &asbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
 
-        // Store channel count for callback
         sharedState.channelCount = Int(channelCount)
+        sharedState.updateDCFilterCoefficient(sampleRate: Float(captureSampleRate))
 
-        // Store format for callback
-        audioFormat = asbd
-
-        // Set render callback
         let state = Unmanaged.passUnretained(sharedState).toOpaque()
-        let server = Unmanaged.passUnretained(streamServer).toOpaque()
 
         var callbackStruct = AURenderCallbackStruct(
             inputProc: inputRenderCallback,
@@ -225,8 +211,7 @@ class AudioMonitor {
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback,
                            kAudioUnitScope_Global, 0, &callbackStruct, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
 
-        // Store pointers for callback
-        sharedState.streamServerPtr = server
+        sharedState.streamServerPtr = Unmanaged.passUnretained(streamServer).toOpaque()
         sharedState.inputUnit = unit
 
         AudioUnitInitialize(unit)
@@ -249,18 +234,17 @@ class AudioMonitor {
         guard AudioComponentInstanceNew(component, &unit) == noErr,
               let unit = unit else { return false }
 
-        // Set device
         var deviceIDVar = deviceID
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                            kAudioUnitScope_Global, 0, &deviceIDVar, UInt32(MemoryLayout<AudioDeviceID>.size))
 
-        // Get device format
+        optimizeDeviceBufferSize(deviceID)
+
         var asbd = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
         AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
                            kAudioUnitScope_Input, 0, &asbd, &size)
 
-        // Set format to match input (preserve channel count)
         let channelCount = asbd.mChannelsPerFrame
         asbd.mFormatID = kAudioFormatLinearPCM
         asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved
@@ -274,7 +258,6 @@ class AudioMonitor {
         AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
                            kAudioUnitScope_Input, 0, &asbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
 
-        // Set render callback to feed from input
         let state = Unmanaged.passUnretained(sharedState).toOpaque()
         var callbackStruct = AURenderCallbackStruct(
             inputProc: outputRenderCallback,
@@ -288,17 +271,32 @@ class AudioMonitor {
         return true
     }
 
+    private func optimizeDeviceBufferSize(_ deviceID: AudioDeviceID) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSize,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var currentSize: UInt32 = 0
+        var propSize = UInt32(MemoryLayout<UInt32>.size)
+        guard AudioObjectGetPropertyData(deviceID, &address, 0, nil, &propSize, &currentSize) == noErr else { return }
+
+        if currentSize > 512 {
+            var newSize: UInt32 = 512
+            AudioObjectSetPropertyData(deviceID, &address, 0, nil,
+                                      UInt32(MemoryLayout<UInt32>.size), &newSize)
+        }
+    }
+
     // MARK: - UI Updates
 
     private var uiUpdateTimer: Timer?
 
     func startUIUpdateTimer() {
-        // Reduce from 30Hz to 20Hz to save CPU
         uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
             self.peakLevel = self.sharedState.getPeakLevel()
         }
-        // Add to common run loop mode so it continues firing during UI tracking (slider dragging)
         if let timer = uiUpdateTimer {
             RunLoop.current.add(timer, forMode: .common)
         }
@@ -319,26 +317,64 @@ private class SharedAudioState {
     private var _gain: Float = 1.0
     private var _meteringEnabled: Bool = false
     private var _eqBands: [Float] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-    private var bufferCounter = 0
     var streamServerPtr: UnsafeMutableRawPointer?
     var inputUnit: AudioUnit?
     var channelCount: Int = 2
 
-    // Ring buffer for passthrough
-    private var ringBuffer = RingBuffer(capacity: 8192)
+    // Stereo ring buffers (one per channel)
+    private var leftRingBuffer = RingBuffer(capacity: 16384)
+    private var rightRingBuffer = RingBuffer(capacity: 16384)
 
-    // Pre-allocated working buffers to avoid allocations in audio callback
-    private var workBuffer1 = [Float](repeating: 0, count: 4096)
-    private var workBuffer2 = [Float](repeating: 0, count: 4096)
+    // Pre-allocated work buffers for input callback (stable pointers, no ARC in RT thread)
+    private static let bufferCapacity = 4096
+    private let workLeft: UnsafeMutablePointer<Float>
+    private let workRight: UnsafeMutablePointer<Float>
+    private let workInterleaved: UnsafeMutablePointer<Float>
+    // Separate buffer for output callback to avoid concurrent access
+    private let workOutput: UnsafeMutablePointer<Float>
+
+    // DC offset filter state (only touched by input callback thread)
+    var dcLeftPrevX: Float = 0
+    var dcLeftPrevY: Float = 0
+    var dcRightPrevX: Float = 0
+    var dcRightPrevY: Float = 0
+    var dcFilterR: Float = 0.9972
+
+    init() {
+        let cap = SharedAudioState.bufferCapacity
+        workLeft = .allocate(capacity: cap)
+        workLeft.initialize(repeating: 0, count: cap)
+        workRight = .allocate(capacity: cap)
+        workRight.initialize(repeating: 0, count: cap)
+        workInterleaved = .allocate(capacity: cap * 2)
+        workInterleaved.initialize(repeating: 0, count: cap * 2)
+        workOutput = .allocate(capacity: cap)
+        workOutput.initialize(repeating: 0, count: cap)
+    }
+
+    deinit {
+        workLeft.deallocate()
+        workRight.deallocate()
+        workInterleaved.deallocate()
+        workOutput.deallocate()
+    }
+
+    func updateDCFilterCoefficient(sampleRate: Float) {
+        dcFilterR = expf(-2.0 * Float.pi * 20.0 / sampleRate)
+    }
 
     func reset() {
         os_unfair_lock_lock(&lock)
         _smoothedPeak = 0
         _volume = 0
-        bufferCounter = 0
         inputUnit = nil
-        ringBuffer.reset()
+        leftRingBuffer.reset()
+        rightRingBuffer.reset()
         os_unfair_lock_unlock(&lock)
+        dcLeftPrevX = 0
+        dcLeftPrevY = 0
+        dcRightPrevX = 0
+        dcRightPrevY = 0
     }
 
     func setVolume(_ vol: Float) {
@@ -386,7 +422,6 @@ private class SharedAudioState {
         return peak
     }
 
-    // Called from real-time thread - MUST be lock-free where possible
     func updatePeak(rms: Float, gain: Float) {
         let rawLevel = min(rms * 4.0, 1.0)
         let level = min(rawLevel * gain, 1.0)
@@ -397,12 +432,15 @@ private class SharedAudioState {
         os_unfair_lock_unlock(&lock)
     }
 
-    func writeAudio(_ buffer: UnsafePointer<Float>, count: Int) {
-        ringBuffer.write(buffer, count: count)
+    func writeStereo(left: UnsafePointer<Float>, right: UnsafePointer<Float>, count: Int) {
+        leftRingBuffer.write(left, count: count)
+        rightRingBuffer.write(right, count: count)
     }
 
-    func readAudio(_ buffer: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        return ringBuffer.read(buffer, count: count)
+    func readStereo(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, count: Int) -> Int {
+        let l = leftRingBuffer.read(left, count: count)
+        let r = rightRingBuffer.read(right, count: count)
+        return min(l, r)
     }
 
     func getVolume() -> Float {
@@ -419,9 +457,12 @@ private class SharedAudioState {
         return g
     }
 
-    func getWorkBuffers() -> (UnsafeMutablePointer<Float>, UnsafeMutablePointer<Float>) {
-        return (workBuffer1.withUnsafeMutableBufferPointer { $0.baseAddress! },
-                workBuffer2.withUnsafeMutableBufferPointer { $0.baseAddress! })
+    func getInputWorkBuffers() -> (left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, interleaved: UnsafeMutablePointer<Float>) {
+        return (workLeft, workRight, workInterleaved)
+    }
+
+    func getOutputWorkBuffer() -> UnsafeMutablePointer<Float> {
+        return workOutput
     }
 
     func applyEqualizer(_ buffer: UnsafeMutablePointer<Float>, count: Int) {
@@ -450,7 +491,7 @@ private class SharedAudioState {
 // MARK: - Ring Buffer
 
 private class RingBuffer {
-    private var buffer: [Float]
+    private let buffer: UnsafeMutablePointer<Float>
     private var writePos = 0
     private var readPos = 0
     private var availableFrames = 0
@@ -459,7 +500,12 @@ private class RingBuffer {
 
     init(capacity: Int) {
         self.capacity = capacity
-        self.buffer = [Float](repeating: 0, count: capacity)
+        buffer = .allocate(capacity: capacity)
+        buffer.initialize(repeating: 0, count: capacity)
+    }
+
+    deinit {
+        buffer.deallocate()
     }
 
     func reset() {
@@ -474,12 +520,14 @@ private class RingBuffer {
         os_unfair_lock_lock(&lock)
         let toWrite = min(count, capacity - availableFrames)
 
-        for i in 0..<toWrite {
-            buffer[writePos] = data[i]
-            writePos = (writePos + 1) % capacity
+        let firstChunk = min(toWrite, capacity - writePos)
+        memcpy(buffer + writePos, data, firstChunk * MemoryLayout<Float>.stride)
+        if firstChunk < toWrite {
+            memcpy(buffer, data + firstChunk, (toWrite - firstChunk) * MemoryLayout<Float>.stride)
         }
 
-        availableFrames = min(availableFrames + toWrite, capacity)
+        writePos = (writePos + toWrite) % capacity
+        availableFrames += toWrite
         os_unfair_lock_unlock(&lock)
     }
 
@@ -487,17 +535,18 @@ private class RingBuffer {
         os_unfair_lock_lock(&lock)
         let toRead = min(count, availableFrames)
 
-        for i in 0..<toRead {
-            data[i] = buffer[readPos]
-            readPos = (readPos + 1) % capacity
+        let firstChunk = min(toRead, capacity - readPos)
+        memcpy(data, buffer + readPos, firstChunk * MemoryLayout<Float>.stride)
+        if firstChunk < toRead {
+            memcpy(data + firstChunk, buffer, (toRead - firstChunk) * MemoryLayout<Float>.stride)
         }
 
+        readPos = (readPos + toRead) % capacity
         availableFrames -= toRead
         os_unfair_lock_unlock(&lock)
 
-        // Fill remainder with silence
         if toRead < count {
-            memset(data + toRead, 0, (count - toRead) * MemoryLayout<Float>.size)
+            memset(data + toRead, 0, (count - toRead) * MemoryLayout<Float>.stride)
         }
 
         return toRead
@@ -521,80 +570,104 @@ private func inputRenderCallback(
 
     let channelCount = state.channelCount
     let frameCount = Int(inNumberFrames)
-    let byteSize = inNumberFrames * UInt32(MemoryLayout<Float>.size)
+    let byteSize = inNumberFrames * UInt32(MemoryLayout<Float>.stride)
 
-    // Use pre-allocated work buffers (no allocations!)
-    let (monoBuffer, gainedBuffer) = state.getWorkBuffers()
+    let (leftBuf, rightBuf, interleavedBuf) = state.getInputWorkBuffers()
 
-    if channelCount == 2 {
-        // AudioBufferList only has inline storage for 1 AudioBuffer.
-        // Use a tuple to get contiguous stack memory for the second buffer,
-        // avoiding heap allocation in this real-time callback.
+    // Render audio — preserve stereo when available
+    if channelCount >= 2 {
         var stereoABL: (AudioBufferList, AudioBuffer) = (
             AudioBufferList(
                 mNumberBuffers: 2,
                 mBuffers: AudioBuffer(
                     mNumberChannels: 1,
                     mDataByteSize: byteSize,
-                    mData: UnsafeMutableRawPointer(monoBuffer)
+                    mData: UnsafeMutableRawPointer(leftBuf)
                 )
             ),
             AudioBuffer(
                 mNumberChannels: 1,
                 mDataByteSize: byteSize,
-                mData: UnsafeMutableRawPointer(gainedBuffer)
+                mData: UnsafeMutableRawPointer(rightBuf)
             )
         )
+        var renderStatus: OSStatus = noErr
         withUnsafeMutablePointer(to: &stereoABL) { ptr in
             let ablPtr = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: AudioBufferList.self)
-            let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, ablPtr)
-            guard status == noErr else { return }
-
-            vDSP_vadd(monoBuffer, 1, gainedBuffer, 1, monoBuffer, 1, vDSP_Length(frameCount))
-            var divisor: Float = 2.0
-            vDSP_vsdiv(monoBuffer, 1, &divisor, monoBuffer, 1, vDSP_Length(frameCount))
+            renderStatus = AudioUnitRender(unit, ioActionFlags, inTimeStamp, 1, inNumberFrames, ablPtr)
         }
+        guard renderStatus == noErr else { return renderStatus }
     } else {
         var bufferList = AudioBufferList(
             mNumberBuffers: 1,
             mBuffers: AudioBuffer(
                 mNumberChannels: 1,
                 mDataByteSize: byteSize,
-                mData: UnsafeMutableRawPointer(monoBuffer)
+                mData: UnsafeMutableRawPointer(leftBuf)
             )
         )
-        AudioUnitRender(unit, ioActionFlags, inTimeStamp, inBusNumber, inNumberFrames, &bufferList)
+        let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
+        guard status == noErr else { return status }
+        memcpy(rightBuf, leftBuf, frameCount * MemoryLayout<Float>.stride)
     }
 
-    // Get current gain for processing
+    // DC offset removal — one-pole high-pass (~20 Hz cutoff) removes turntable rumble
+    // and DC bias without affecting audible content
+    let R = state.dcFilterR
+    var lpx = state.dcLeftPrevX, lpy = state.dcLeftPrevY
+    var rpx = state.dcRightPrevX, rpy = state.dcRightPrevY
+
+    for i in 0..<frameCount {
+        let lx = leftBuf[i]
+        lpy = lx - lpx + R * lpy
+        lpx = lx
+        leftBuf[i] = lpy
+
+        let rx = rightBuf[i]
+        rpy = rx - rpx + R * rpy
+        rpx = rx
+        rightBuf[i] = rpy
+    }
+
+    state.dcLeftPrevX = lpx; state.dcLeftPrevY = lpy
+    state.dcRightPrevX = rpx; state.dcRightPrevY = rpy
+
+    // Metering — average RMS of both channels for a single meter reading
     let currentGain = state.getGain()
-
-    // Only calculate RMS and update meter if metering is enabled
     if state.isMeteringEnabled() {
-        var rms: Float = 0
-        vDSP_rmsqv(monoBuffer, 1, &rms, vDSP_Length(frameCount))
-        state.updatePeak(rms: rms, gain: currentGain)
+        var leftRms: Float = 0, rightRms: Float = 0
+        vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(frameCount))
+        vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(frameCount))
+        state.updatePeak(rms: (leftRms + rightRms) * 0.5, gain: currentGain)
     }
 
-    // Apply gain for passthrough and streaming (reuse gainedBuffer)
+    // Apply gain to both channels
     if currentGain != 1.0 {
-        var gain = currentGain
-        vDSP_vsmul(monoBuffer, 1, &gain, gainedBuffer, 1, vDSP_Length(frameCount))
-    } else {
-        // Just copy if gain is 1.0
-        memcpy(gainedBuffer, monoBuffer, frameCount * MemoryLayout<Float>.size)
+        var g = currentGain
+        vDSP_vsmul(leftBuf, 1, &g, leftBuf, 1, vDSP_Length(frameCount))
+        vDSP_vsmul(rightBuf, 1, &g, rightBuf, 1, vDSP_Length(frameCount))
     }
 
-    // Apply equalizer
-    state.applyEqualizer(gainedBuffer, count: frameCount)
+    // Apply equalizer to both stereo channels
+    state.applyEqualizer(leftBuf, count: frameCount)
+    state.applyEqualizer(rightBuf, count: frameCount)
 
-    // Write to ring buffer for passthrough (with gain applied)
-    state.writeAudio(gainedBuffer, count: frameCount)
+    // Hard clip at ±1.0 as a safety net against digital overs
+    var lo: Float = -1.0, hi: Float = 1.0
+    vDSP_vclip(leftBuf, 1, &lo, &hi, leftBuf, 1, vDSP_Length(frameCount))
+    vDSP_vclip(rightBuf, 1, &lo, &hi, rightBuf, 1, vDSP_Length(frameCount))
 
-    // Send to stream server if streaming (with gain applied)
+    // Write stereo to ring buffers for passthrough
+    state.writeStereo(left: leftBuf, right: rightBuf, count: frameCount)
+
+    // Broadcast interleaved stereo to stream clients
     if let serverPtr = state.streamServerPtr {
         let server = Unmanaged<AudioStreamServer>.fromOpaque(serverPtr).takeUnretainedValue()
-        server.broadcast(gainedBuffer, count: frameCount)
+        for i in 0..<frameCount {
+            interleavedBuf[i * 2] = leftBuf[i]
+            interleavedBuf[i * 2 + 1] = rightBuf[i]
+        }
+        server.broadcast(interleavedBuf, frameCount: frameCount)
     }
 
     return noErr
@@ -616,23 +689,41 @@ private func outputRenderCallback(
     let frameCount = Int(inNumberFrames)
     let bufferList = UnsafeMutableAudioBufferListPointer(bufferListPtr)
 
-    // Use pre-allocated work buffer (no allocations!)
-    let (monoBuffer, _) = state.getWorkBuffers()
-
-    // Read mono audio from ring buffer
-    _ = state.readAudio(monoBuffer, count: frameCount)
-
-    // Apply volume/gain
-    let volume = state.getVolume()
-    if volume != 1.0 {
-        var vol = volume
-        vDSP_vsmul(monoBuffer, 1, &vol, monoBuffer, 1, vDSP_Length(frameCount))
+    guard bufferList.count >= 1,
+          let ch0 = bufferList[0].mData?.assumingMemoryBound(to: Float.self) else {
+        return noErr
     }
 
-    // Copy mono to all output channels
-    for i in 0..<bufferList.count {
-        guard let channelData = bufferList[i].mData?.assumingMemoryBound(to: Float.self) else { continue }
-        channelData.update(from: monoBuffer, count: frameCount)
+    let volume = state.getVolume()
+
+    if bufferList.count >= 2, let ch1 = bufferList[1].mData?.assumingMemoryBound(to: Float.self) {
+        // Stereo output — read L/R directly into output buffers
+        _ = state.readStereo(left: ch0, right: ch1, count: frameCount)
+
+        if volume != 1.0 {
+            var vol = volume
+            vDSP_vsmul(ch0, 1, &vol, ch0, 1, vDSP_Length(frameCount))
+            vDSP_vsmul(ch1, 1, &vol, ch1, 1, vDSP_Length(frameCount))
+        }
+    } else {
+        // Mono output — read stereo and sum to mono
+        let tempRight = state.getOutputWorkBuffer()
+        _ = state.readStereo(left: ch0, right: tempRight, count: frameCount)
+        vDSP_vadd(ch0, 1, tempRight, 1, ch0, 1, vDSP_Length(frameCount))
+        var half: Float = 0.5
+        vDSP_vsmul(ch0, 1, &half, ch0, 1, vDSP_Length(frameCount))
+
+        if volume != 1.0 {
+            var vol = volume
+            vDSP_vsmul(ch0, 1, &vol, ch0, 1, vDSP_Length(frameCount))
+        }
+    }
+
+    // Silence any extra channels beyond stereo
+    for i in 2..<bufferList.count {
+        if let chData = bufferList[i].mData {
+            memset(chData, 0, Int(bufferList[i].mDataByteSize))
+        }
     }
 
     return noErr

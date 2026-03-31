@@ -52,9 +52,9 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
         isRunning = false
     }
 
-    func broadcast(_ samples: UnsafePointer<Float>, count: Int) {
+    func broadcast(_ samples: UnsafePointer<Float>, frameCount: Int) {
         guard isRunning else { return }
-        let data = Data(bytes: samples, count: count * MemoryLayout<Float>.size)
+        let data = Data(bytes: samples, count: frameCount * 2 * MemoryLayout<Float>.size)
         queue.async { [weak self] in
             guard let self, !self.connections.isEmpty else { return }
             for (id, conn) in self.connections {
@@ -120,7 +120,7 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
 
     private func wavResponseHeader() -> Data {
         let sr = UInt32(sampleRate)
-        let channels: UInt16 = 1
+        let channels: UInt16 = 2
         let bitsPerSample: UInt16 = 32
         let byteRate = sr * UInt32(channels) * UInt32(bitsPerSample / 8)
         let blockAlign = channels * (bitsPerSample / 8)
@@ -318,6 +318,7 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
           <div class="spec">
             <div class="spec-item"><i data-lucide="audio-waveform" style="width:12px;height:12px"></i><span>32-bit float</span></div>
             <div class="spec-item"><i data-lucide="activity" style="width:12px;height:12px"></i><span>44.1 kHz</span></div>
+            <div class="spec-item"><i data-lucide="headphones" style="width:12px;height:12px"></i><span>Stereo</span></div>
             <div class="spec-item"><i data-lucide="shield-check" style="width:12px;height:12px"></i><span>Lossless PCM</span></div>
           </div>
 
