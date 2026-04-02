@@ -54,7 +54,10 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
 
     func broadcast(_ samples: UnsafePointer<Float>, frameCount: Int) {
         guard isRunning else { return }
-        let data = Data(bytes: samples, count: frameCount * 2 * MemoryLayout<Float>.size)
+        // Copy audio data on the calling thread (fast memcpy) then dispatch
+        // to the network queue. Data(bytes:count:) is a single allocation + memcpy.
+        let byteCount = frameCount * 2 * MemoryLayout<Float>.size
+        let data = Data(bytes: samples, count: byteCount)
         queue.async { [weak self] in
             guard let self, !self.connections.isEmpty else { return }
             for (id, conn) in self.connections {
@@ -102,7 +105,7 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
                 })
             } else {
                 let ip = Self.localIPAddress() ?? "localhost"
-                let html = Self.landingPageHTML(host: ip, port: self.port)
+                let html = Self.landingPageHTML(host: ip, port: self.port, sampleRate: self.sampleRate)
                 var header = "HTTP/1.1 200 OK\r\n"
                 header += "Content-Type: text/html; charset=utf-8\r\n"
                 header += "Content-Length: \(html.utf8.count)\r\n"
@@ -159,7 +162,10 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
 
     // MARK: - Landing page
 
-    private static func landingPageHTML(host: String, port: UInt16) -> String {
+    private static func landingPageHTML(host: String, port: UInt16, sampleRate: Double = 44100) -> String {
+        let sampleRateDisplay = sampleRate >= 1000
+            ? String(format: "%.1f kHz", sampleRate / 1000)
+            : String(format: "%.0f Hz", sampleRate)
         let streamURL = "http://\(host):\(port)/stream"
         return """
         <!DOCTYPE html>
@@ -317,7 +323,7 @@ nonisolated final class AudioStreamServer: @unchecked Sendable {
 
           <div class="spec">
             <div class="spec-item"><i data-lucide="audio-waveform" style="width:12px;height:12px"></i><span>32-bit float</span></div>
-            <div class="spec-item"><i data-lucide="activity" style="width:12px;height:12px"></i><span>44.1 kHz</span></div>
+            <div class="spec-item"><i data-lucide="activity" style="width:12px;height:12px"></i><span>\(sampleRateDisplay)</span></div>
             <div class="spec-item"><i data-lucide="headphones" style="width:12px;height:12px"></i><span>Stereo</span></div>
             <div class="spec-item"><i data-lucide="shield-check" style="width:12px;height:12px"></i><span>Lossless PCM</span></div>
           </div>
