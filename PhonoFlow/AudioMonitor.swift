@@ -2,11 +2,12 @@
 //  AudioMonitor.swift
 //  PhonoFlow
 //
-//  Industrial-grade stereo audio monitoring with real-time DSP:
+//  High-fidelity stereo audio monitoring with real-time DSP:
 //  - 10-band parametric EQ (biquad, Transposed Direct Form II)
 //  - Soft limiter (tanh-based, transparent below threshold)
-//  - Clock drift compensation (adaptive resampling)
+//  - Clock drift compensation (Catmull-Rom cubic resampling, same-device bypass)
 //  - DC offset removal (first-order high-pass)
+//  - Output sample rate matching (eliminates HAL resampling)
 //
 
 import Accelerate
@@ -22,11 +23,11 @@ private enum AudioConfig {
     static let eqFrequencies: [Float] = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
     static let eqQ: Float = 1.414 // sqrt(2), standard graphic EQ bandwidth
     static let softLimitThreshold: Float = 0.891 // -1 dBFS
-    static let ringCapacity = 16384
+    static let ringCapacity = 4096
     static let workCapacity = 4096
-    static let driftTarget = 2048 // ~46 ms at 44.1 kHz
-    static let driftThreshold = 512
-    static let targetBufferFrames: UInt32 = 512
+    static let driftTarget = 1024  // ~23 ms at 44.1 kHz — tighter for lower latency
+    static let driftThreshold = 128 // correct drift early and often
+    static let targetBufferFrames: UInt32 = 256
 }
 
 // MARK: - Audio Monitor
@@ -73,6 +74,7 @@ class AudioMonitor {
             return
         }
 
+        sharedState.sameDevice = (inputDeviceID == self.outputDeviceID)
         sharedState.setGain(gain)
         sharedState.setVolume(isPassthroughEnabled ? gain : 0)
         sharedState.setMeteringEnabled(isMeteringEnabled)
@@ -259,21 +261,9 @@ class AudioMonitor {
         AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
                            kAudioUnitScope_Global, 0, &deviceIDVar, UInt32(MemoryLayout<AudioDeviceID>.size))
 
+        // Match output device sample rate to input — eliminates HAL resampling
+        setOutputDeviceSampleRate(deviceID, sampleRate: captureSampleRate)
         setDeviceBufferSize(deviceID)
-
-        // Query the output device's native sample rate for diagnostics
-        var outputNativeRate: Double = 0
-        var rateSize = UInt32(MemoryLayout<Double>.size)
-        var nominalRateAddr = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
-            mScope: kAudioObjectPropertyScopeOutput,
-            mElement: kAudioObjectPropertyElementMain
-        )
-        if AudioObjectGetPropertyData(deviceID, &nominalRateAddr, 0, nil, &rateSize, &outputNativeRate) == noErr,
-           outputNativeRate != captureSampleRate {
-            os_log(.info, "PhonoFlow: Input rate %.0f Hz ≠ output native rate %.0f Hz — HAL will resample",
-                   captureSampleRate, outputNativeRate)
-        }
 
         var asbd = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
@@ -304,6 +294,17 @@ class AudioMonitor {
         AudioUnitInitialize(unit)
         outputUnit = unit
         return true
+    }
+
+    private func setOutputDeviceSampleRate(_ deviceID: AudioDeviceID, sampleRate: Double) {
+        var address = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyNominalSampleRate,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain
+        )
+        var rate = sampleRate
+        AudioObjectSetPropertyData(deviceID, &address, 0, nil,
+                                  UInt32(MemoryLayout<Double>.size), &rate)
     }
 
     private func setDeviceBufferSize(_ deviceID: AudioDeviceID) {
@@ -418,6 +419,7 @@ private class SharedAudioState {
     var streamServerPtr: UnsafeMutableRawPointer?
     var inputUnit: AudioUnit?
     var channelCount: Int = 2
+    var sameDevice: Bool = false
 
     // DC offset filter state (input callback thread only)
     var dcLeftPrevX: Float = 0
@@ -689,8 +691,9 @@ private func applySoftLimiter(_ buffer: UnsafeMutablePointer<Float>, count: Int)
     }
 }
 
-/// Linear resample srcCount samples → dstCount samples
-private func linearResample(
+/// Catmull-Rom cubic resample srcCount samples → dstCount samples
+/// Much higher quality than linear interpolation — preserves high-frequency detail
+private func cubicResample(
     src: UnsafePointer<Float>, srcCount: Int,
     dst: UnsafeMutablePointer<Float>, dstCount: Int
 ) {
@@ -698,22 +701,29 @@ private func linearResample(
         memcpy(dst, src, dstCount * MemoryLayout<Float>.stride)
         return
     }
-    guard srcCount > 0, dstCount > 0 else {
+    guard srcCount > 1, dstCount > 0 else {
         if dstCount > 0 { memset(dst, 0, dstCount * MemoryLayout<Float>.stride) }
         return
     }
-    if srcCount == 1 {
-        var val = src[0]
-        vDSP_vfill(&val, dst, 1, vDSP_Length(dstCount))
-        return
-    }
 
-    let ratio = Float(srcCount - 1) / Float(dstCount - 1)
+    let ratio = Float(srcCount - 1) / Float(max(dstCount - 1, 1))
     for i in 0..<dstCount {
         let srcPos = Float(i) * ratio
-        let idx = min(Int(srcPos), srcCount - 2)
+        let idx = Int(srcPos)
         let frac = srcPos - Float(idx)
-        dst[i] = src[idx] + frac * (src[idx + 1] - src[idx])
+
+        // Catmull-Rom spline with clamped boundary indices
+        let p0 = src[max(idx - 1, 0)]
+        let p1 = src[min(idx, srcCount - 1)]
+        let p2 = src[min(idx + 1, srcCount - 1)]
+        let p3 = src[min(idx + 2, srcCount - 1)]
+
+        let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+        let b =       p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3
+        let c = -0.5 * p0            + 0.5 * p2
+        let d =                  p1
+
+        dst[i] = ((a * frac + b) * frac + c) * frac + d
     }
 }
 
@@ -765,38 +775,48 @@ private func inputRenderCallback(
         memcpy(rightBuf, leftBuf, frameCount * MemoryLayout<Float>.stride)
     }
 
-    // DC offset removal — first-order high-pass (~20 Hz)
-    let R = state.dcFilterR
-    var lpx = state.dcLeftPrevX, lpy = state.dcLeftPrevY
-    var rpx = state.dcRightPrevX, rpy = state.dcRightPrevY
-
-    for i in 0..<frameCount {
-        let lx = leftBuf[i]; lpy = lx - lpx + R * lpy; lpx = lx; leftBuf[i] = lpy
-        let rx = rightBuf[i]; rpy = rx - rpx + R * rpy; rpx = rx; rightBuf[i] = rpy
-    }
-    state.dcLeftPrevX = lpx; state.dcLeftPrevY = lpy
-    state.dcRightPrevX = rpx; state.dcRightPrevY = rpy
-
     // Batch-read parameters (single lock acquisition)
     let params = state.getParams()
 
+    // Sync EQ state to check if DSP is needed
+    state.syncEQCoefficients()
+    let eqActive = state.cachedEqActive
+    let gainActive = params.gain != 1.0
+
+    // Clean passthrough when no processing is engaged (Audacity-style transparent wire).
+    // DC filter + limiter only run when EQ is active, since EQ boosts can cause DC
+    // offset and clipping. Without EQ, the signal passes through bit-perfect.
+    if eqActive {
+        // DC offset removal — first-order high-pass (~20 Hz)
+        // Only needed when EQ is active (boosted bands can amplify DC from preamp)
+        let R = state.dcFilterR
+        var lpx = state.dcLeftPrevX, lpy = state.dcLeftPrevY
+        var rpx = state.dcRightPrevX, rpy = state.dcRightPrevY
+
+        for i in 0..<frameCount {
+            let lx = leftBuf[i]; lpy = lx - lpx + R * lpy; lpx = lx; leftBuf[i] = lpy
+            let rx = rightBuf[i]; rpy = rx - rpx + R * rpy; rpx = rx; rightBuf[i] = rpy
+        }
+        state.dcLeftPrevX = lpx; state.dcLeftPrevY = lpy
+        state.dcRightPrevX = rpx; state.dcRightPrevY = rpy
+    }
+
     // Apply gain
-    if params.gain != 1.0 {
+    if gainActive {
         var g = params.gain
         vDSP_vsmul(leftBuf, 1, &g, leftBuf, 1, vDSP_Length(frameCount))
         vDSP_vsmul(rightBuf, 1, &g, rightBuf, 1, vDSP_Length(frameCount))
     }
 
     // Apply 10-band parametric EQ
-    state.syncEQCoefficients()
-    if state.cachedEqActive {
+    if eqActive {
         applyEQ(leftBuf, count: frameCount, coeffs: state.eqCoeffs, state: state.eqStateL)
         applyEQ(rightBuf, count: frameCount, coeffs: state.eqCoeffs, state: state.eqStateR)
-    }
 
-    // Soft limiter (replaces hard clip)
-    applySoftLimiter(leftBuf, count: frameCount)
-    applySoftLimiter(rightBuf, count: frameCount)
+        // Soft limiter — only needed when EQ is active (boosts can clip)
+        applySoftLimiter(leftBuf, count: frameCount)
+        applySoftLimiter(rightBuf, count: frameCount)
+    }
 
     // Metering — average RMS of both channels
     if params.meteringEnabled {
@@ -847,14 +867,16 @@ private func outputRenderCallback(
 
     let volume = state.getParams().volume
 
-    // Drift compensation: adjust how many frames we consume from the ring buffer
-    // to keep fill level near target, preventing clock drift accumulation
-    let fill = state.ringFillLevel()
+    // Drift compensation: only needed when input/output are on different devices
+    // (different clock domains). Same-device shares one clock — no drift possible.
     var framesToRead = frameCount
-    if fill > AudioConfig.driftTarget + AudioConfig.driftThreshold {
-        framesToRead = frameCount + 1
-    } else if fill > 0, fill < AudioConfig.driftTarget - AudioConfig.driftThreshold {
-        framesToRead = max(frameCount - 1, 1)
+    if !state.sameDevice {
+        let fill = state.ringFillLevel()
+        if fill > AudioConfig.driftTarget + AudioConfig.driftThreshold {
+            framesToRead = frameCount + 1
+        } else if fill > 0, fill < AudioConfig.driftTarget - AudioConfig.driftThreshold {
+            framesToRead = max(frameCount - 1, 1)
+        }
     }
 
     let tempL = state.workOutL
@@ -868,8 +890,8 @@ private func outputRenderCallback(
             memcpy(ch0, tempL, frameCount * MemoryLayout<Float>.stride)
             memcpy(ch1, tempR, frameCount * MemoryLayout<Float>.stride)
         } else if read > 0 {
-            linearResample(src: tempL, srcCount: read, dst: ch0, dstCount: frameCount)
-            linearResample(src: tempR, srcCount: read, dst: ch1, dstCount: frameCount)
+            cubicResample(src: tempL, srcCount: read, dst: ch0, dstCount: frameCount)
+            cubicResample(src: tempR, srcCount: read, dst: ch1, dstCount: frameCount)
         } else {
             memset(ch0, 0, frameCount * MemoryLayout<Float>.stride)
             memset(ch1, 0, frameCount * MemoryLayout<Float>.stride)
@@ -892,7 +914,7 @@ private func outputRenderCallback(
             if read == frameCount {
                 memcpy(ch0, tempL, frameCount * MemoryLayout<Float>.stride)
             } else {
-                linearResample(src: tempL, srcCount: read, dst: ch0, dstCount: frameCount)
+                cubicResample(src: tempL, srcCount: read, dst: ch0, dstCount: frameCount)
             }
         } else {
             memset(ch0, 0, frameCount * MemoryLayout<Float>.stride)
