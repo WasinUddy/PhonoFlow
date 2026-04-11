@@ -47,6 +47,16 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+
+            if self.settings.isProMode {
+                Section("Visualizations") {
+                    Toggle("Advanced Visualizations", isOn: settings.showAdvancedVisualizations)
+
+                    Text("Shows real-time waveform, spectrogram, phase scope, and dual level meters.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
         }
         .formStyle(.grouped)
         .padding(12)

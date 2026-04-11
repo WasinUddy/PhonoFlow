@@ -75,14 +75,12 @@ struct ContentView: View {
         }
         .onChange(of: settings.isProMode) { _, newValue in
             audioMonitor.isMeteringEnabled = newValue
-            if newValue {
-                // Start UI updates when switching to pro mode
+            // Always ensure UI timer is running when monitoring is active
+            if audioMonitor.isMonitoring {
                 audioMonitor.startUIUpdateTimer()
-            } else {
-                // Disable all Pro features when switching to basic mode
-                if audioMonitor.isStreamingEnabled {
-                    audioMonitor.stopStreaming()
-                }
+            }
+            if !newValue, audioMonitor.isStreamingEnabled {
+                audioMonitor.stopStreaming()
             }
         }
     }
@@ -223,13 +221,37 @@ struct ContentView: View {
 
             if settings.isProMode {
                 sectionCard {
-                    WaveformView(peakLevel: self.audioMonitor.peakLevel,
+                    WaveformView(leftLevel: self.audioMonitor.leftLevel,
+                                 rightLevel: self.audioMonitor.rightLevel,
                                  gain: audioMonitor.gain,
+                                 isAutoGainEnabled: audioMonitor.isAutoGainEnabled,
                                  theme: theme)
                 }
 
                 sectionCard {
                     EqualizerView(eqBands: audioMonitor.eqBands, theme: theme)
+                }
+            }
+
+            // Advanced visualizations — works independently of monitoring
+            if settings.isProMode, settings.showAdvancedVisualizations {
+                HStack(alignment: .top, spacing: 8) {
+                    sectionCard {
+                        AdvancedWaveformView(leftWaveform: self.audioMonitor.leftWaveform,
+                                           rightWaveform: self.audioMonitor.rightWaveform,
+                                           theme: theme)
+                    }
+
+                    sectionCard {
+                        PhaseScopeView(points: self.audioMonitor.phasePoints,
+                                     theme: theme)
+                    }
+                    .frame(width: 130)
+                }
+
+                sectionCard {
+                    SpectrogramView(spectrogramData: self.audioMonitor.spectrogramData,
+                                  theme: theme)
                 }
             }
 

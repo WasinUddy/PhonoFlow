@@ -40,6 +40,23 @@ class AudioMonitor {
     var isPassthroughEnabled = false
     var isStreamingEnabled = false
     var streamURL: String = ""
+    var isAutoGainEnabled: Bool = false {
+        didSet {
+            if isAutoGainEnabled {
+                startAutoGain()
+            } else {
+                stopAutoGain()
+            }
+        }
+    }
+
+    // Visualization data
+    var leftWaveform: [Float] = Array(repeating: 0, count: 200)
+    var rightWaveform: [Float] = Array(repeating: 0, count: 200)
+    var phasePoints: [(x: Float, y: Float)] = []
+    var leftLevel: Float = 0
+    var rightLevel: Float = 0
+    var spectrogramData: [[Float]] = []
 
     @MainActor var eqBands: [Float] = Array(repeating: 0, count: AudioConfig.eqBandCount) {
         didSet {
@@ -86,9 +103,8 @@ class AudioMonitor {
 
         isMonitoring = true
 
-        if isMeteringEnabled {
-            startUIUpdateTimer()
-        }
+        // Always start UI update timer for visualizations and metering
+        startUIUpdateTimer()
     }
 
     func stopMonitoring() {
@@ -323,18 +339,169 @@ class AudioMonitor {
     private var uiUpdateTimer: Timer?
 
     func startUIUpdateTimer() {
+        // Prevent stacking multiple timers
+        uiUpdateTimer?.invalidate()
+
         uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
-            self.peakLevel = self.sharedState.getPeakLevel()
+
+            // Update peak level only if metering is enabled
+            if self.isMeteringEnabled {
+                self.peakLevel = self.sharedState.getPeakLevel()
+            }
+
+            // Always update visualization data (works in all modes)
+            self.updateVisualizationData()
         }
         if let timer = uiUpdateTimer {
             RunLoop.current.add(timer, forMode: .common)
         }
     }
 
+    // FFT setup (reused across calls)
+    private var fftSetup: FFTSetup?
+    private let fftLog2N: vDSP_Length = 8  // 256 samples
+    private let fftSize = 256
+
+    private func updateVisualizationData() {
+        let bufferSize = 512
+        let leftBuf = UnsafeMutablePointer<Float>.allocate(capacity: bufferSize)
+        let rightBuf = UnsafeMutablePointer<Float>.allocate(capacity: bufferSize)
+        defer {
+            leftBuf.deallocate()
+            rightBuf.deallocate()
+        }
+
+        let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: bufferSize)
+        guard count > 0 else { return }
+
+        // Update waveform data (first 200 samples)
+        let waveformCount = min(200, count)
+        leftWaveform = Array(UnsafeBufferPointer(start: leftBuf, count: waveformCount))
+        rightWaveform = Array(UnsafeBufferPointer(start: rightBuf, count: waveformCount))
+
+        // Update phase scope points (downsample to 100 points)
+        let step = max(waveformCount / 100, 1)
+        phasePoints = stride(from: 0, to: waveformCount, by: step).map { i in
+            (x: leftBuf[i], y: rightBuf[i])
+        }
+
+        // Update separate L/R levels — scale RMS to 0-1 meter range with smoothing
+        var leftRms: Float = 0, rightRms: Float = 0
+        vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
+        vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
+
+        let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
+        let scaledRight = min(rightRms * 4.0 * gain, 1.0)
+
+        // Smooth: fast attack (0.85), slow decay (0.25)
+        let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
+        let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
+        leftLevel += attackL * (scaledLeft - leftLevel)
+        rightLevel += attackR * (scaledRight - rightLevel)
+
+        // Update spectrogram with FFT
+        if count >= fftSize {
+            if fftSetup == nil {
+                fftSetup = vDSP_create_fftsetup(fftLog2N, FFTRadix(kFFTRadix2))
+            }
+
+            if let setup = fftSetup {
+                let spectrum = computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup)
+
+                // Add to spectrogram history (keep last 100 frames)
+                spectrogramData.append(spectrum)
+                if spectrogramData.count > 100 {
+                    spectrogramData.removeFirst()
+                }
+            }
+        }
+    }
+
+    private func computeFFTSpectrum(samples: UnsafePointer<Float>, count: Int, setup: FFTSetup) -> [Float] {
+        let halfSize = count / 2
+
+        var realp = [Float](repeating: 0, count: halfSize)
+        var imagp = [Float](repeating: 0, count: halfSize)
+
+        return realp.withUnsafeMutableBufferPointer { realBuffer in
+            imagp.withUnsafeMutableBufferPointer { imagBuffer in
+                var output = DSPSplitComplex(realp: realBuffer.baseAddress!, imagp: imagBuffer.baseAddress!)
+
+                // Convert samples to split complex format
+                samples.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) { complexSamples in
+                    vDSP_ctoz(complexSamples, 2, &output, 1, vDSP_Length(halfSize))
+                }
+
+                // Perform FFT
+                vDSP_fft_zrip(setup, &output, 1, fftLog2N, FFTDirection(FFT_FORWARD))
+
+                // Compute magnitude
+                var magnitudes = [Float](repeating: 0, count: halfSize)
+                vDSP_zvabs(&output, 1, &magnitudes, 1, vDSP_Length(halfSize))
+
+                // Convert to dB and normalize
+                var normalizedMagnitudes = [Float](repeating: 0, count: halfSize)
+                for i in 0..<halfSize {
+                    let db = 20 * log10(max(magnitudes[i], 0.00001))
+                    normalizedMagnitudes[i] = max(0, min(1, (db + 80) / 80))  // Map -80dB to 0dB → 0 to 1
+                }
+
+                return normalizedMagnitudes
+            }
+        }
+    }
+
+    deinit {
+        if let setup = fftSetup {
+            vDSP_destroy_fftsetup(setup)
+        }
+    }
+
     private func stopUIUpdateTimer() {
         uiUpdateTimer?.invalidate()
         uiUpdateTimer = nil
+    }
+
+    // MARK: - Auto-Gain
+
+    private var autoGainTimer: Timer?
+    private let autoGainTargetLevel: Float = 0.5  // -6 dBFS (safe headroom)
+    private let autoGainMinLevel: Float = 0.01    // -40 dBFS (ignore very quiet signals)
+    private let autoGainSmoothingFactor: Float = 0.1  // Slow, smooth adjustments
+
+    func startAutoGain() {
+        autoGainTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.adjustAutoGain()
+        }
+        if let timer = autoGainTimer {
+            RunLoop.current.add(timer, forMode: .common)
+        }
+    }
+
+    func stopAutoGain() {
+        autoGainTimer?.invalidate()
+        autoGainTimer = nil
+    }
+
+    private func adjustAutoGain() {
+        guard isAutoGainEnabled, peakLevel > autoGainMinLevel else { return }
+
+        // Calculate target gain: scale current peak to target level
+        let targetGain = autoGainTargetLevel / peakLevel
+
+        // Clamp to reasonable range (0.1x to 4.0x)
+        let clampedTarget = max(0.1, min(4.0, targetGain))
+
+        // Smoothly interpolate current gain toward target
+        gain += autoGainSmoothingFactor * (clampedTarget - gain)
+
+        // Update passthrough volume if enabled
+        if isPassthroughEnabled {
+            sharedState.setGain(gain)
+            sharedState.setVolume(gain)
+        }
     }
 }
 
@@ -362,14 +529,21 @@ private class RingBuffer {
     }
 
     func write(_ data: UnsafePointer<Float>, count: Int) {
-        let toWrite = min(count, capacity - available)
+        let toWrite = min(count, capacity)
         let firstChunk = min(toWrite, capacity - writePos)
         memcpy(buffer + writePos, data, firstChunk * MemoryLayout<Float>.stride)
         if firstChunk < toWrite {
             memcpy(buffer, data + firstChunk, (toWrite - firstChunk) * MemoryLayout<Float>.stride)
         }
         writePos = (writePos + toWrite) % capacity
+
+        // Advance read pointer if we overwrote unread data
         available += toWrite
+        if available > capacity {
+            let overflow = available - capacity
+            readPos = (readPos + overflow) % capacity
+            available = capacity
+        }
     }
 
     func read(_ data: UnsafeMutablePointer<Float>, count: Int) -> Int {
@@ -385,6 +559,21 @@ private class RingBuffer {
             memset(data + toRead, 0, (count - toRead) * MemoryLayout<Float>.stride)
         }
         return toRead
+    }
+
+    // Peek at most recent data without consuming it
+    func peekRecent(_ data: UnsafeMutablePointer<Float>, count: Int) -> Int {
+        let toPeek = min(count, available)
+        guard toPeek > 0 else { return 0 }
+
+        // Calculate starting position for most recent samples
+        let peekStart = (writePos - toPeek + capacity) % capacity
+        let firstChunk = min(toPeek, capacity - peekStart)
+        memcpy(data, buffer + peekStart, firstChunk * MemoryLayout<Float>.stride)
+        if firstChunk < toPeek {
+            memcpy(data + firstChunk, buffer, (toPeek - firstChunk) * MemoryLayout<Float>.stride)
+        }
+        return toPeek
     }
 }
 
@@ -600,6 +789,20 @@ private class SharedAudioState {
         let fill = min(leftRing.available, rightRing.available)
         os_unfair_lock_unlock(&ringLock)
         return fill
+    }
+
+    func peekStereoRecent(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, count: Int) -> Int {
+        os_unfair_lock_lock(&ringLock)
+        let avail = min(leftRing.available, rightRing.available)
+        let toPeek = min(count, avail)
+        _ = leftRing.peekRecent(left, count: toPeek)
+        _ = rightRing.peekRecent(right, count: toPeek)
+        os_unfair_lock_unlock(&ringLock)
+        if toPeek < count {
+            memset(left + toPeek, 0, (count - toPeek) * MemoryLayout<Float>.stride)
+            memset(right + toPeek, 0, (count - toPeek) * MemoryLayout<Float>.stride)
+        }
+        return toPeek
     }
 
     func reset() {

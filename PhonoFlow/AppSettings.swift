@@ -63,6 +63,7 @@ private enum SettingsKeys {
     static let proMode = "proMode"
     static let launchAtLogin = "launchAtLogin"
     static let hasAskedLaunchAtLogin = "hasAskedLaunchAtLogin"
+    static let showAdvancedVisualizations = "showAdvancedVisualizations"
 }
 
 // Shared colors used across the UI — centralised to avoid scattered literal RGB values.
@@ -77,10 +78,12 @@ enum AppColors {
     static let meterWarningYellow = Color(red: 1.0, green: 0.75, blue: 0.15)
 }
 
-// LED meter segment thresholds — shared between WaveformView and SettingsView preview.
+// LED meter segment thresholds on dB-scaled meter (0-1 fraction maps to -40 to 0 dB).
+//   -3 dB → fraction 0.925   (red: near clipping)
+//  -10 dB → fraction 0.75    (yellow: getting hot)
 enum MeterThresholds {
-    static let peak: Float    = 0.92
-    static let warning: Float = 0.75
+    static let peak: Float    = 0.925  // -3 dB
+    static let warning: Float = 0.75   // -10 dB
 }
 
 @Observable
@@ -112,6 +115,10 @@ class AppSettings {
         set { UserDefaults.standard.set(newValue, forKey: SettingsKeys.hasAskedLaunchAtLogin) }
     }
 
+    var showAdvancedVisualizations: Bool {
+        didSet { UserDefaults.standard.set(showAdvancedVisualizations, forKey: SettingsKeys.showAdvancedVisualizations) }
+    }
+
     init() {
         let ud = UserDefaults.standard
         if let raw = ud.string(forKey: SettingsKeys.theme),
@@ -137,6 +144,9 @@ class AppSettings {
 
         // Launch at login
         launchAtLogin = ud.bool(forKey: SettingsKeys.launchAtLogin)
+
+        // Advanced visualizations toggle (default off)
+        showAdvancedVisualizations = ud.object(forKey: SettingsKeys.showAdvancedVisualizations) == nil ? false : ud.bool(forKey: SettingsKeys.showAdvancedVisualizations)
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
