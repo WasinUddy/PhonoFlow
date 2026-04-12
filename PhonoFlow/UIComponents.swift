@@ -35,6 +35,45 @@ struct GlassButtonStyle: ButtonStyle {
     }
 }
 
+// MARK: - Visualization Info Button
+
+/// Reusable info button for visualization headers. Shows a popover with interpretation tips.
+func vizInfoButton(title: String, showInfo: Binding<Bool>, tips: [String]) -> some View {
+    HStack(spacing: 4) {
+        Text(title)
+            .font(.system(size: 9, weight: .semibold, design: .rounded))
+            .foregroundStyle(.primary.opacity(0.5))
+
+        Button(action: { showInfo.wrappedValue.toggle() }) {
+            Image(systemName: "info.circle")
+                .font(.system(size: 9))
+                .foregroundStyle(.primary.opacity(0.35))
+        }
+        .buttonStyle(.plain)
+        .popover(isPresented: showInfo, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("How to Read")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(.primary)
+
+                ForEach(tips, id: \.self) { tip in
+                    HStack(alignment: .top, spacing: 6) {
+                        Circle()
+                            .fill(.primary.opacity(0.4))
+                            .frame(width: 4, height: 4)
+                            .padding(.top, 4)
+                        Text(tip)
+                            .font(.system(size: 10))
+                            .foregroundStyle(.primary.opacity(0.8))
+                    }
+                }
+            }
+            .padding(10)
+            .frame(width: 260)
+        }
+    }
+}
+
 // MARK: - Equalizer View
 
 struct EqualizerView: View {

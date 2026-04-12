@@ -52,9 +52,13 @@ struct SettingsView: View {
                 Section("Visualizations") {
                     Toggle("Advanced Visualizations", isOn: settings.showAdvancedVisualizations)
 
-                    Text("Shows real-time waveform, spectrogram, phase scope, and dual level meters.")
+                    Text("Shows real-time waveform, spectrogram, and phase scope.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+
+                    Label("Uses additional CPU for real-time FFT analysis and rendering. Disable if you experience high CPU usage or reduced battery life.", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
                 }
             }
         }

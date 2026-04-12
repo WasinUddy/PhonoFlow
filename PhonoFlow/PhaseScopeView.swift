@@ -10,19 +10,25 @@ import SwiftUI
 struct PhaseScopeView: View {
     var points: [(x: Float, y: Float)]
     var theme: ColorTheme
+    @State private var showInfo = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("PHASE SCOPE")
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.5))
+                vizInfoButton(
+                    title: "PHASE SCOPE",
+                    showInfo: $showInfo,
+                    tips: [
+                        "Vertical line = mono (L and R identical)",
+                        "Circle/blob = wide stereo image",
+                        "Horizontal line = one channel missing",
+                        "Leaning left/right = off-center stereo",
+                        "Random scatter = phase issues or inverted wiring",
+                    ]
+                )
                 Spacer()
-                Text("L↔ R↕")
-                    .font(.system(size: 8, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.primary.opacity(0.4))
             }
-            .padding(.bottom, 6)
+            .padding(.bottom, 4)
 
             Canvas { context, size in
                 let side = min(size.width, size.height)

@@ -47,6 +47,9 @@ struct ContentView: View {
                 }
             }
 
+            // Resume visualizations when popover opens
+            audioMonitor.resumeVisualizations()
+
             // Ask about launch at login on first launch
             if !settings.hasAskedLaunchAtLogin {
                 settings.hasAskedLaunchAtLogin = true
@@ -54,6 +57,10 @@ struct ContentView: View {
                     showLaunchAtLoginPrompt()
                 }
             }
+        }
+        .onDisappear {
+            // Pause visualizations when popover closes to save CPU/battery
+            audioMonitor.pauseVisualizations()
         }
         .onChange(of: audioManager.selectedInputDeviceID) { _, newValue in
             audioManager.refreshDevices()
@@ -250,7 +257,8 @@ struct ContentView: View {
                 }
 
                 sectionCard {
-                    SpectrogramView(spectrogramData: self.audioMonitor.spectrogramData,
+                    SpectrogramView(spectrogramImage: self.audioMonitor.spectrogramImage,
+                                  sampleRate: self.audioMonitor.captureSampleRate,
                                   theme: theme)
                 }
             }

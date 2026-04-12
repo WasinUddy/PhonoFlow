@@ -56,10 +56,23 @@ class AudioMonitor {
     var phasePoints: [(x: Float, y: Float)] = []
     var leftLevel: Float = 0
     var rightLevel: Float = 0
-    var spectrogramData: [[Float]] = []
+    var spectrogramImage: CGImage?
+
+    // Internal spectrogram circular buffer (avoids O(n) removeFirst)
+    private let spectrogramMaxFrames = 60
+    private var spectrogramFrames: [[Float]] = []
+    private var spectrogramWriteIdx = 0
+    private var spectrogramCount = 0
+
+    // Pause visualizations when app is collapsed to save CPU/battery
+    var visualizationsPaused: Bool = false
+
+    // Keep a nonisolated copy for the audio thread to read during setup
+    private var lastEqBands: [Float] = Array(repeating: 0, count: AudioConfig.eqBandCount)
 
     @MainActor var eqBands: [Float] = Array(repeating: 0, count: AudioConfig.eqBandCount) {
         didSet {
+            lastEqBands = eqBands
             sharedState.updateEQCoefficients(bands: eqBands, sampleRate: Float(captureSampleRate))
         }
     }
@@ -238,8 +251,7 @@ class AudioMonitor {
 
         sharedState.channelCount = Int(channelCount)
         sharedState.updateDCFilterCoefficient(sampleRate: Float(captureSampleRate))
-        sharedState.updateEQCoefficients(bands: Array(repeating: 0, count: AudioConfig.eqBandCount),
-                                         sampleRate: Float(captureSampleRate))
+        sharedState.updateEQCoefficients(bands: lastEqBands, sampleRate: Float(captureSampleRate))
 
         let state = Unmanaged.passUnretained(sharedState).toOpaque()
 
@@ -338,20 +350,30 @@ class AudioMonitor {
 
     private var uiUpdateTimer: Timer?
 
+    // Pre-allocated viz buffers (avoid alloc/dealloc every frame)
+    private let vizBufSize = 1024
+    private let vizLeftBuf: UnsafeMutablePointer<Float> = .allocate(capacity: 1024)
+    private let vizRightBuf: UnsafeMutablePointer<Float> = .allocate(capacity: 1024)
+
     func startUIUpdateTimer() {
         // Prevent stacking multiple timers
         uiUpdateTimer?.invalidate()
 
-        uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/20.0, repeats: true) { [weak self] _ in
+        uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/15.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
 
-            // Update peak level only if metering is enabled
+            // Always update metering (needed for L/R level meters)
             if self.isMeteringEnabled {
                 self.peakLevel = self.sharedState.getPeakLevel()
             }
 
-            // Always update visualization data (works in all modes)
-            self.updateVisualizationData()
+            // Skip expensive viz work when app is collapsed
+            if !self.visualizationsPaused {
+                self.updateVisualizationData()
+            } else {
+                // Still update L/R levels for the meter bars (cheap)
+                self.updateLevelsOnly()
+            }
         }
         if let timer = uiUpdateTimer {
             RunLoop.current.add(timer, forMode: .common)
@@ -360,33 +382,22 @@ class AudioMonitor {
 
     // FFT setup (reused across calls)
     private var fftSetup: FFTSetup?
-    private let fftLog2N: vDSP_Length = 8  // 256 samples
-    private let fftSize = 256
+    private let fftLog2N: vDSP_Length = 10
+    private let fftSize = 1024
 
-    private func updateVisualizationData() {
-        let bufferSize = 512
-        let leftBuf = UnsafeMutablePointer<Float>.allocate(capacity: bufferSize)
-        let rightBuf = UnsafeMutablePointer<Float>.allocate(capacity: bufferSize)
-        defer {
-            leftBuf.deallocate()
-            rightBuf.deallocate()
-        }
+    // Spectrogram image rendering constants
+    private let spectrogramLogRows = 90
+    private let spectrogramMinFreq: Double = 20
+    private let spectrogramMaxFreq: Double = 20000
 
-        let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: bufferSize)
+    /// Lightweight update — only L/R levels for meter bars when viz is paused
+    private func updateLevelsOnly() {
+        let leftBuf = vizLeftBuf
+        let rightBuf = vizRightBuf
+
+        let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: vizBufSize)
         guard count > 0 else { return }
 
-        // Update waveform data (first 200 samples)
-        let waveformCount = min(200, count)
-        leftWaveform = Array(UnsafeBufferPointer(start: leftBuf, count: waveformCount))
-        rightWaveform = Array(UnsafeBufferPointer(start: rightBuf, count: waveformCount))
-
-        // Update phase scope points (downsample to 100 points)
-        let step = max(waveformCount / 100, 1)
-        phasePoints = stride(from: 0, to: waveformCount, by: step).map { i in
-            (x: leftBuf[i], y: rightBuf[i])
-        }
-
-        // Update separate L/R levels — scale RMS to 0-1 meter range with smoothing
         var leftRms: Float = 0, rightRms: Float = 0
         vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
         vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
@@ -394,13 +405,62 @@ class AudioMonitor {
         let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
         let scaledRight = min(rightRms * 4.0 * gain, 1.0)
 
-        // Smooth: fast attack (0.85), slow decay (0.25)
+        let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
+        let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
+        leftLevel += attackL * (scaledLeft - leftLevel)
+        rightLevel += attackR * (scaledRight - rightLevel)
+    }
+
+    /// Clear spectrogram history and resume fresh
+    func clearSpectrogram() {
+        spectrogramFrames.removeAll()
+        spectrogramWriteIdx = 0
+        spectrogramCount = 0
+        spectrogramPixels.removeAll()
+        spectrogramImage = nil
+    }
+
+    func pauseVisualizations() {
+        visualizationsPaused = true
+    }
+
+    func resumeVisualizations() {
+        visualizationsPaused = false
+        clearSpectrogram()
+    }
+
+    private func updateVisualizationData() {
+        let leftBuf = vizLeftBuf
+        let rightBuf = vizRightBuf
+
+        let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: vizBufSize)
+        guard count > 0 else { return }
+
+        // Update waveform data
+        let waveformCount = min(200, count)
+        leftWaveform = Array(UnsafeBufferPointer(start: leftBuf, count: waveformCount))
+        rightWaveform = Array(UnsafeBufferPointer(start: rightBuf, count: waveformCount))
+
+        // Update phase scope points (downsample to 60 points)
+        let step = max(waveformCount / 60, 1)
+        phasePoints = stride(from: 0, to: waveformCount, by: step).map { i in
+            (x: leftBuf[i], y: rightBuf[i])
+        }
+
+        // Update L/R levels with smoothing
+        var leftRms: Float = 0, rightRms: Float = 0
+        vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
+        vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
+
+        let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
+        let scaledRight = min(rightRms * 4.0 * gain, 1.0)
+
         let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
         let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
         leftLevel += attackL * (scaledLeft - leftLevel)
         rightLevel += attackR * (scaledRight - rightLevel)
 
-        // Update spectrogram with FFT
+        // FFT → spectrogram
         if count >= fftSize {
             if fftSetup == nil {
                 fftSetup = vDSP_create_fftsetup(fftLog2N, FFTRadix(kFFTRadix2))
@@ -409,13 +469,118 @@ class AudioMonitor {
             if let setup = fftSetup {
                 let spectrum = computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup)
 
-                // Add to spectrogram history (keep last 100 frames)
-                spectrogramData.append(spectrum)
-                if spectrogramData.count > 100 {
-                    spectrogramData.removeFirst()
+                // Circular buffer write — O(1), no array shifting
+                if spectrogramFrames.count < spectrogramMaxFrames {
+                    spectrogramFrames.append(spectrum)
+                } else {
+                    spectrogramFrames[spectrogramWriteIdx] = spectrum
                 }
+                spectrogramWriteIdx = (spectrogramWriteIdx + 1) % spectrogramMaxFrames
+                spectrogramCount = min(spectrogramCount + 1, spectrogramMaxFrames)
+
+                // Render spectrogram to bitmap image
+                spectrogramImage = renderSpectrogramImage()
             }
         }
+    }
+
+    // Reusable pixel buffer — avoids allocation every frame
+    private var spectrogramPixels: [UInt8] = []
+
+    /// Renders spectrogram data into a CGImage — single image blit instead of thousands of Canvas rects.
+    private func renderSpectrogramImage() -> CGImage? {
+        let width = spectrogramCount
+        let height = spectrogramLogRows
+        guard width > 0 else { return nil }
+
+        let nyquist = captureSampleRate / 2.0
+        let logMin = log(spectrogramMinFreq)
+        let logMax = log(spectrogramMaxFreq)
+        let logRange = logMax - logMin
+        let totalBins = spectrogramFrames.first?.count ?? 512
+
+        // Reuse pixel buffer, resize only if needed
+        let pixelCount = width * height * 4
+        if spectrogramPixels.count != pixelCount {
+            spectrogramPixels = [UInt8](repeating: 0, count: pixelCount)
+        } else {
+            spectrogramPixels.withUnsafeMutableBufferPointer { buf in
+                memset(buf.baseAddress!, 0, pixelCount)
+            }
+        }
+
+        // Read frames in chronological order from circular buffer
+        let startIdx = spectrogramCount < spectrogramMaxFrames ? 0 : spectrogramWriteIdx
+
+        for col in 0..<width {
+            let frameIdx = (startIdx + col) % spectrogramFrames.count
+            let spectrum = spectrogramFrames[frameIdx]
+
+            for row in 0..<height {
+                let logFreq = logMin + logRange * Double(row) / Double(height)
+                let freq = exp(logFreq)
+                let bin = freq / nyquist * Double(totalBins)
+                let binIdx = Int(bin)
+
+                guard binIdx >= 0, binIdx < spectrum.count else { continue }
+
+                let frac = Float(bin - Double(binIdx))
+                let val0 = spectrum[binIdx]
+                let val1 = binIdx + 1 < spectrum.count ? spectrum[binIdx + 1] : val0
+                let magnitude = val0 + frac * (val1 - val0)
+
+                let (r, g, b) = spectrogramRGB(magnitude: magnitude)
+
+                let pixelRow = height - 1 - row
+                let idx = (pixelRow * width + col) * 4
+                spectrogramPixels[idx]     = r
+                spectrogramPixels[idx + 1] = g
+                spectrogramPixels[idx + 2] = b
+                spectrogramPixels[idx + 3] = 255
+            }
+        }
+
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        return spectrogramPixels.withUnsafeBufferPointer { buf in
+            guard let provider = CGDataProvider(data: Data(buffer: buf) as CFData) else { return nil }
+
+            return CGImage(
+                width: width, height: height,
+                bitsPerComponent: 8, bitsPerPixel: 32,
+                bytesPerRow: width * 4,
+                space: colorSpace,
+                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                provider: provider,
+                decode: nil, shouldInterpolate: true,
+                intent: .defaultIntent
+            )
+        }
+    }
+
+    private func spectrogramRGB(magnitude: Float) -> (UInt8, UInt8, UInt8) {
+        let c = min(max(magnitude, 0), 1)
+
+        let r: Float, g: Float, b: Float
+        if c < 0.15 {
+            r = 0; g = 0; b = c / 0.15 * 0.5
+        } else if c < 0.35 {
+            let t = (c - 0.15) / 0.2
+            r = 0; g = 0; b = 0.5 + t * 0.5
+        } else if c < 0.55 {
+            let t = (c - 0.35) / 0.2
+            r = 0; g = t; b = 1
+        } else if c < 0.75 {
+            let t = (c - 0.55) / 0.2
+            r = t; g = 1; b = 1 - t
+        } else if c < 0.9 {
+            let t = (c - 0.75) / 0.15
+            r = 1; g = 1 - t * 0.7; b = 0
+        } else {
+            let t = (c - 0.9) / 0.1
+            r = 1; g = 0.3 - t * 0.3; b = 0
+        }
+
+        return (UInt8(r * 255), UInt8(g * 255), UInt8(b * 255))
     }
 
     private func computeFFTSpectrum(samples: UnsafePointer<Float>, count: Int, setup: FFTSetup) -> [Float] {
@@ -436,15 +601,18 @@ class AudioMonitor {
                 // Perform FFT
                 vDSP_fft_zrip(setup, &output, 1, fftLog2N, FFTDirection(FFT_FORWARD))
 
-                // Compute magnitude
+                // Compute magnitude and normalize by FFT size
                 var magnitudes = [Float](repeating: 0, count: halfSize)
                 vDSP_zvabs(&output, 1, &magnitudes, 1, vDSP_Length(halfSize))
 
-                // Convert to dB and normalize
+                let scale = 2.0 / Float(count)  // Proper FFT amplitude normalization
+                vDSP_vsmul(magnitudes, 1, [scale], &magnitudes, 1, vDSP_Length(halfSize))
+
+                // Convert to dB and normalize — 96 dB dynamic range (-96 dB to 0 dB)
                 var normalizedMagnitudes = [Float](repeating: 0, count: halfSize)
                 for i in 0..<halfSize {
-                    let db = 20 * log10(max(magnitudes[i], 0.00001))
-                    normalizedMagnitudes[i] = max(0, min(1, (db + 80) / 80))  // Map -80dB to 0dB → 0 to 1
+                    let db = 20 * log10(max(magnitudes[i], 1e-10))
+                    normalizedMagnitudes[i] = max(0, min(1, (db + 96) / 96))
                 }
 
                 return normalizedMagnitudes
@@ -456,6 +624,8 @@ class AudioMonitor {
         if let setup = fftSetup {
             vDSP_destroy_fftsetup(setup)
         }
+        vizLeftBuf.deallocate()
+        vizRightBuf.deallocate()
     }
 
     private func stopUIUpdateTimer() {

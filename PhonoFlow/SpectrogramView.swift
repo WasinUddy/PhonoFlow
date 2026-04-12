@@ -2,80 +2,158 @@
 //  SpectrogramView.swift
 //  PhonoFlow
 //
-//  Real-time frequency-over-time visualization using FFT analysis.
+//  Real-time frequency-over-time spectrogram with logarithmic Y-axis.
 //
 
 import SwiftUI
-import Accelerate
 
 struct SpectrogramView: View {
-    var spectrogramData: [[Float]]
+    var spectrogramImage: CGImage?
+    var sampleRate: Double
     var theme: ColorTheme
-    private let historyLength = 100
+    @State private var showInfo = false
+
+    private let minFreq: Double = 20
+    private let maxFreq: Double = 20000
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("SPECTROGRAM")
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.5))
+                vizInfoButton(
+                    title: "SPECTROGRAM",
+                    showInfo: $showInfo,
+                    tips: [
+                        "Bright band at bottom (20-100 Hz) = turntable rumble",
+                        "Darkness above 8-10 kHz = worn stylus",
+                        "Vertical bright lines = clicks/pops (dust or scratches)",
+                        "Persistent horizontal line = resonance or feedback",
+                        "Faint haze above 5 kHz = surface noise",
+                    ]
+                )
                 Spacer()
-                HStack(spacing: 8) {
-                    Text("0 Hz")
-                    Text("→")
-                        .foregroundStyle(.primary.opacity(0.3))
-                    Text("22 kHz")
-                }
-                .font(.system(size: 8, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary.opacity(0.4))
+                Text("\u{2190} TIME")
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.primary.opacity(0.3))
             }
             .padding(.bottom, 6)
 
-            Canvas { context, size in
-                guard !spectrogramData.isEmpty else {
-                    // Draw placeholder when no data
-                    var text = context.resolve(Text("No signal").font(.system(size: 11, weight: .medium)))
-                    text.shading = .color(.primary.opacity(0.3))
-                    context.draw(text, at: CGPoint(x: size.width / 2, y: size.height / 2))
-                    return
-                }
+            HStack(spacing: 0) {
+                frequencyAxis
+                    .frame(width: 32)
 
-                let colWidth = max(size.width / CGFloat(spectrogramData.count), 1)
-                let spectrumSize = spectrogramData.first?.count ?? 128
-                let rowHeight = size.height / CGFloat(spectrumSize)
+                ZStack {
+                    // Background
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(Color.primary.opacity(0.03))
 
-                for (col, spectrum) in spectrogramData.enumerated() {
-                    for (row, magnitude) in spectrum.enumerated() {
-                        let x = CGFloat(col) * colWidth
-                        let y = size.height - CGFloat(row + 1) * rowHeight
-                        let rect = CGRect(x: x, y: y, width: colWidth + 1, height: rowHeight + 1)
-
-                        let color = spectrogramColor(magnitude: magnitude)
-                        context.fill(Path(rect), with: .color(color))
+                    if let image = spectrogramImage {
+                        Image(decorative: image, scale: 1)
+                            .resizable()
+                            .interpolation(.none)
+                            .cornerRadius(6)
+                    } else {
+                        Text("No signal")
+                            .font(.system(size: 11, weight: .medium))
+                            .foregroundStyle(.primary.opacity(0.3))
                     }
+
+                    // Frequency grid overlay
+                    Canvas { context, size in
+                        let logMin = log10(minFreq)
+                        let logRange = log10(maxFreq) - logMin
+                        let gridFreqs: [Double] = [50, 100, 200, 500, 1000, 2000, 5000, 10000]
+
+                        for freq in gridFreqs {
+                            let logPos = (log10(freq) - logMin) / logRange
+                            let y = size.height - size.height * CGFloat(logPos)
+                            if y > 2, y < size.height - 2 {
+                                var line = Path()
+                                line.move(to: CGPoint(x: 0, y: y))
+                                line.addLine(to: CGPoint(x: size.width, y: y))
+                                context.stroke(line, with: .color(.white.opacity(0.12)), lineWidth: 0.5)
+                            }
+                        }
+                    }
+                    .allowsHitTesting(false)
                 }
             }
-            .frame(height: 90)
-            .background(Color.primary.opacity(0.03))
-            .cornerRadius(6)
+            .frame(height: 180)
+
+            intensityLegend
+                .padding(.top, 4)
         }
     }
 
-    private func spectrogramColor(magnitude: Float) -> Color {
-        // Map magnitude (0.0 to 1.0) to color gradient
-        let clamped = min(max(magnitude, 0), 1)
+    // MARK: - Frequency Axis
 
-        if clamped < 0.2 {
-            return Color(red: 0, green: 0, blue: Double(clamped * 2.5))
-        } else if clamped < 0.5 {
-            let t = (clamped - 0.2) / 0.3
-            return Color(red: 0, green: Double(t), blue: 1)
-        } else if clamped < 0.8 {
-            let t = (clamped - 0.5) / 0.3
-            return Color(red: Double(t), green: 1, blue: 1 - Double(t))
-        } else {
-            let t = (clamped - 0.8) / 0.2
-            return Color(red: 1, green: 1 - Double(t * 0.5), blue: 0)
+    private var frequencyAxis: some View {
+        GeometryReader { geo in
+            let height = geo.size.height
+            let logMin = log10(minFreq)
+            let logRange = log10(maxFreq) - logMin
+
+            let labels: [(String, Double)] = [
+                ("20k", 20000),
+                ("10k", 10000),
+                ("5k", 5000),
+                ("2k", 2000),
+                ("1k", 1000),
+                ("500", 500),
+                ("200", 200),
+                ("100", 100),
+                ("50", 50),
+                ("20", 20),
+            ]
+
+            ZStack(alignment: .trailing) {
+                ForEach(labels, id: \.0) { label, freq in
+                    let logPos = (log10(freq) - logMin) / logRange
+                    let y = height - height * CGFloat(logPos)
+
+                    if y >= 4, y <= height - 4 {
+                        Text(label)
+                            .font(.system(size: 7, weight: .medium, design: .monospaced))
+                            .foregroundStyle(.primary.opacity(0.45))
+                            .position(x: 14, y: y)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Intensity Legend
+
+    private var intensityLegend: some View {
+        HStack(spacing: 4) {
+            Text("Quiet")
+                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                .foregroundStyle(.primary.opacity(0.35))
+
+            LinearGradient(
+                colors: [
+                    Color(red: 0, green: 0, blue: 0),
+                    Color(red: 0, green: 0, blue: 0.5),
+                    Color(red: 0, green: 0, blue: 1),
+                    Color(red: 0, green: 1, blue: 1),
+                    Color(red: 0, green: 1, blue: 0),
+                    Color(red: 1, green: 1, blue: 0),
+                    Color(red: 1, green: 0.3, blue: 0),
+                ],
+                startPoint: .leading,
+                endPoint: .trailing
+            )
+            .frame(width: 100, height: 6)
+            .cornerRadius(2)
+
+            Text("Loud")
+                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                .foregroundStyle(.primary.opacity(0.35))
+
+            Spacer()
+
+            Text("Hz")
+                .font(.system(size: 7, weight: .medium, design: .monospaced))
+                .foregroundStyle(.primary.opacity(0.35))
         }
     }
 }

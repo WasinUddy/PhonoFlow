@@ -11,13 +11,21 @@ struct AdvancedWaveformView: View {
     var leftWaveform: [Float]
     var rightWaveform: [Float]
     var theme: ColorTheme
+    @State private var showInfo = false
 
     var body: some View {
         VStack(spacing: 0) {
             HStack {
-                Text("WAVEFORM")
-                    .font(.system(size: 9, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.primary.opacity(0.5))
+                vizInfoButton(
+                    title: "WAVEFORM",
+                    showInfo: $showInfo,
+                    tips: [
+                        "Tall waves = loud, flat line = silence",
+                        "Flat ceiling at top/bottom = clipping (lower gain)",
+                        "Compare L vs R — uneven = cartridge misalignment",
+                        "Wiggly line during silence = surface noise or rumble",
+                    ]
+                )
                 Spacer()
                 HStack(spacing: 6) {
                     Circle()
