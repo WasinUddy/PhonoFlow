@@ -40,6 +40,9 @@ class AudioMonitor {
     var isPassthroughEnabled = false
     var isStreamingEnabled = false
     var streamURL: String = ""
+    var isRecording = false
+    var recordingDuration: Double = 0
+    var recordingURL: URL?
     var isAutoGainEnabled: Bool = false {
         didSet {
             if isAutoGainEnabled {
@@ -84,6 +87,7 @@ class AudioMonitor {
 
     private let sharedState = SharedAudioState()
     private let streamServer = AudioStreamServer()
+    private let recorder = AudioRecorder()
     private(set) var captureSampleRate: Double = 44100
 
     var isMeteringEnabled: Bool = false {
@@ -124,6 +128,7 @@ class AudioMonitor {
         stopUIUpdateTimer()
         isPassthroughEnabled = false
         stopStreaming()
+        stopRecording()
 
         if let unit = inputUnit {
             AudioOutputUnitStop(unit)
@@ -198,6 +203,32 @@ class AudioMonitor {
         streamServer.stop()
         isStreamingEnabled = false
         streamURL = ""
+    }
+
+    // MARK: - Recording
+
+    func startRecording() {
+        guard !isRecording else { return }
+        do {
+            let url = try recorder.start(sampleRate: captureSampleRate)
+            recordingURL = url
+            isRecording = true
+            recordingDuration = 0
+            sharedState.recorderPtr = Unmanaged.passUnretained(recorder).toOpaque()
+            os_log(.info, "PhonoFlow: Recording started → %{public}@", url.path)
+        } catch {
+            isRecording = false
+            recordingURL = nil
+            os_log(.error, "PhonoFlow: Recording failed — %{public}@", error.localizedDescription)
+        }
+    }
+
+    func stopRecording() {
+        guard isRecording else { return }
+        sharedState.recorderPtr = nil
+        let url = recorder.stop()
+        isRecording = false
+        recordingURL = url
     }
 
     // MARK: - Audio Unit Setup
@@ -362,9 +393,13 @@ class AudioMonitor {
         uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/15.0, repeats: true) { [weak self] _ in
             guard let self = self else { return }
 
-            // Always update metering (needed for L/R level meters)
             if self.isMeteringEnabled {
                 self.peakLevel = self.sharedState.getPeakLevel()
+            }
+
+            // Update recording duration
+            if self.isRecording {
+                self.recordingDuration = self.recorder.durationSeconds
             }
 
             // Skip expensive viz work when app is collapsed
@@ -776,6 +811,7 @@ private class SharedAudioState {
     var cachedEqActive: Bool = false
 
     var streamServerPtr: UnsafeMutableRawPointer?
+    var recorderPtr: UnsafeMutableRawPointer?
     var inputUnit: AudioUnit?
     var channelCount: Int = 2
     var sameDevice: Bool = false
@@ -1202,15 +1238,26 @@ private func inputRenderCallback(
     // Write to ring buffers (atomic stereo write)
     state.writeStereo(left: leftBuf, right: rightBuf, count: frameCount)
 
-    // Broadcast to stream clients
-    if let serverPtr = state.streamServerPtr {
-        let server = Unmanaged<AudioStreamServer>.fromOpaque(serverPtr).takeUnretainedValue()
+    // Interleave L/R for streaming and recording
+    let needsInterleaved = state.streamServerPtr != nil || state.recorderPtr != nil
+    if needsInterleaved {
         let interleavedBuf = state.workInterleaved
         for i in 0..<frameCount {
             interleavedBuf[i * 2] = leftBuf[i]
             interleavedBuf[i * 2 + 1] = rightBuf[i]
         }
-        server.broadcast(interleavedBuf, frameCount: frameCount)
+
+        // Broadcast to stream clients
+        if let serverPtr = state.streamServerPtr {
+            let server = Unmanaged<AudioStreamServer>.fromOpaque(serverPtr).takeUnretainedValue()
+            server.broadcast(interleavedBuf, frameCount: frameCount)
+        }
+
+        // Write to recorder
+        if let recorderPtr = state.recorderPtr {
+            let recorder = Unmanaged<AudioRecorder>.fromOpaque(recorderPtr).takeUnretainedValue()
+            recorder.write(interleavedBuf, frameCount: frameCount)
+        }
     }
 
     return noErr

@@ -279,36 +279,84 @@ struct ContentView: View {
     // MARK: - Control buttons
 
     private var controlButtons: some View {
-        HStack(spacing: 8) {
-            controlButton(
-                icon: "headphones",
-                label: audioMonitor.isPassthroughEnabled ? "Monitoring" : "Monitor",
-                isActive: audioMonitor.isPassthroughEnabled,
-                activeColor: theme.activeColor
-            ) {
-                if audioMonitor.isPassthroughEnabled {
-                    audioMonitor.disablePassthrough()
-                } else {
-                    audioMonitor.enablePassthrough()
-                }
-            }
-
-            if settings.isProMode {
+        VStack(spacing: 8) {
+            HStack(spacing: 8) {
                 controlButton(
-                    icon: "antenna.radiowaves.left.and.right",
-                    label: audioMonitor.isStreamingEnabled ? "On Air" : "Radio",
-                    isActive: audioMonitor.isStreamingEnabled,
-                    activeColor: AppColors.onAirRed
+                    icon: "headphones",
+                    label: audioMonitor.isPassthroughEnabled ? "Monitoring" : "Monitor",
+                    isActive: audioMonitor.isPassthroughEnabled,
+                    activeColor: theme.activeColor
                 ) {
-                    if audioMonitor.isStreamingEnabled {
-                        audioMonitor.stopStreaming()
+                    if audioMonitor.isPassthroughEnabled {
+                        audioMonitor.disablePassthrough()
                     } else {
-                        audioMonitor.startStreaming(port: settings.radioPort,
-                                                    allowedHosts: settings.allowedHosts)
+                        audioMonitor.enablePassthrough()
+                    }
+                }
+
+                if settings.isProMode {
+                    controlButton(
+                        icon: "antenna.radiowaves.left.and.right",
+                        label: audioMonitor.isStreamingEnabled ? "On Air" : "Radio",
+                        isActive: audioMonitor.isStreamingEnabled,
+                        activeColor: AppColors.onAirRed
+                    ) {
+                        if audioMonitor.isStreamingEnabled {
+                            audioMonitor.stopStreaming()
+                        } else {
+                            audioMonitor.startStreaming(port: settings.radioPort,
+                                                        allowedHosts: settings.allowedHosts)
+                        }
+                    }
+
+                    controlButton(
+                        icon: "circle.fill",
+                        label: self.audioMonitor.isRecording
+                            ? formatDuration(self.audioMonitor.recordingDuration)
+                            : "Record",
+                        isActive: self.audioMonitor.isRecording,
+                        activeColor: AppColors.meterPeakRed
+                    ) {
+                        if audioMonitor.isRecording {
+                            audioMonitor.stopRecording()
+                        } else {
+                            audioMonitor.startRecording()
+                        }
                     }
                 }
             }
+
+            // Recording file info
+            if self.audioMonitor.isRecording, let url = self.audioMonitor.recordingURL {
+                HStack(spacing: 4) {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 8))
+                        .foregroundStyle(AppColors.meterPeakRed)
+                    Text(url.lastPathComponent)
+                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.primary.opacity(0.5))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: url.deletingLastPathComponent().path)
+                    } label: {
+                        Image(systemName: "folder")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.primary.opacity(0.4))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Show in Finder")
+                }
+                .padding(.horizontal, 4)
+            }
         }
+    }
+
+    private func formatDuration(_ seconds: Double) -> String {
+        let mins = Int(seconds) / 60
+        let secs = Int(seconds) % 60
+        return String(format: "REC %d:%02d", mins, secs)
     }
 
     // MARK: - Reusable components
