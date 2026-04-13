@@ -13,8 +13,10 @@
 import Accelerate
 import AudioToolbox
 import CoreAudio
+import CoreVideo
 import Foundation
 import os.lock
+import QuartzCore
 
 // MARK: - Configuration
 
@@ -60,12 +62,18 @@ class AudioMonitor {
     var leftLevel: Float = 0
     var rightLevel: Float = 0
     var spectrogramImage: CGImage?
+    var spectrogramEnabled: Bool = false
 
     // Internal spectrogram circular buffer (avoids O(n) removeFirst)
-    private let spectrogramMaxFrames = 60
+    // 90 frames at 24fps = 3.75 seconds of history
+    private let spectrogramMaxFrames = 90
     private var spectrogramFrames: [[Float]] = []
     private var spectrogramWriteIdx = 0
     private var spectrogramCount = 0
+
+    // Background rendering queue (prevent UI thread blocking)
+    private let spectrogramQueue = DispatchQueue(label: "com.phonoflow.spectrogram", qos: .userInitiated)
+    private var isRenderingSpectrogram = false
 
     // Pause visualizations when app is collapsed to save CPU/battery
     var visualizationsPaused: Bool = false
@@ -379,7 +387,9 @@ class AudioMonitor {
 
     // MARK: - UI Updates
 
-    private var uiUpdateTimer: Timer?
+    private var displayLink: CVDisplayLink?
+    private var lastUpdateTime: CFTimeInterval = 0
+    private var lastSpectrogramUpdate: CFTimeInterval = 0
 
     // Pre-allocated viz buffers (avoid alloc/dealloc every frame)
     private let vizBufSize = 1024
@@ -387,31 +397,69 @@ class AudioMonitor {
     private let vizRightBuf: UnsafeMutablePointer<Float> = .allocate(capacity: 1024)
 
     func startUIUpdateTimer() {
-        // Prevent stacking multiple timers
-        uiUpdateTimer?.invalidate()
+        stopUIUpdateTimer()
 
-        uiUpdateTimer = Timer.scheduledTimer(withTimeInterval: 1.0/15.0, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
+        // CVDisplayLink for macOS (synced to display refresh)
+        var link: CVDisplayLink?
+        CVDisplayLinkCreateWithActiveCGDisplays(&link)
 
-            if self.isMeteringEnabled {
-                self.peakLevel = self.sharedState.getPeakLevel()
+        guard let displayLink = link else { return }
+
+        // Callback function for CVDisplayLink
+        let callback: CVDisplayLinkOutputCallback = { (_, _, _, _, _, userData) -> CVReturn in
+            guard let userData = userData else { return kCVReturnSuccess }
+            let monitor = Unmanaged<AudioMonitor>.fromOpaque(userData).takeUnretainedValue()
+
+            // Perform update on main thread
+            DispatchQueue.main.async {
+                monitor.performUIUpdate()
             }
 
-            // Update recording duration
-            if self.isRecording {
-                self.recordingDuration = self.recorder.durationSeconds
-            }
-
-            // Skip expensive viz work when app is collapsed
-            if !self.visualizationsPaused {
-                self.updateVisualizationData()
-            } else {
-                // Still update L/R levels for the meter bars (cheap)
-                self.updateLevelsOnly()
-            }
+            return kCVReturnSuccess
         }
-        if let timer = uiUpdateTimer {
-            RunLoop.current.add(timer, forMode: .common)
+
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        CVDisplayLinkSetOutputCallback(displayLink, callback, selfPtr)
+        CVDisplayLinkStart(displayLink)
+
+        self.displayLink = displayLink
+    }
+
+    private func performUIUpdate() {
+        let now = CACurrentMediaTime()
+
+        // Throttle expensive operations
+        let timeSinceLastUpdate = now - lastUpdateTime
+        let timeSinceSpectrogram = now - lastSpectrogramUpdate
+
+        // Skip if updating too fast (throttle to ~60fps max)
+        guard timeSinceLastUpdate >= (1.0 / 60.0) else { return }
+        lastUpdateTime = now
+
+        if isMeteringEnabled {
+            peakLevel = sharedState.getPeakLevel()
+        }
+
+        // Update recording duration
+        if isRecording {
+            recordingDuration = recorder.durationSeconds
+        }
+
+        // Skip expensive viz work when app is collapsed
+        if !visualizationsPaused {
+            // Update spectrogram at 24fps (cinema-smooth, low CPU)
+            let shouldUpdateSpectrogram = spectrogramEnabled && (timeSinceSpectrogram >= (1.0 / 24.0))
+
+            if shouldUpdateSpectrogram {
+                lastSpectrogramUpdate = now
+                updateVisualizationData()
+            } else {
+                // Update waveforms and phase scope (lightweight)
+                updateVisualizationDataLightweight()
+            }
+        } else {
+            // Still update L/R levels for the meter bars (cheap)
+            updateLevelsOnly()
         }
     }
 
@@ -420,10 +468,43 @@ class AudioMonitor {
     private let fftLog2N: vDSP_Length = 10
     private let fftSize = 1024
 
-    // Spectrogram image rendering constants
-    private let spectrogramLogRows = 90
+    // Spectrogram image rendering constants (optimized for CPU efficiency)
+    private let spectrogramLogRows = 80  // Reduced from 90 for better performance
     private let spectrogramMinFreq: Double = 20
     private let spectrogramMaxFreq: Double = 20000
+
+    /// Lightweight update — waveforms and phase at refresh rate, no spectrogram
+    private func updateVisualizationDataLightweight() {
+        let leftBuf = vizLeftBuf
+        let rightBuf = vizRightBuf
+
+        let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: vizBufSize)
+        guard count > 0 else { return }
+
+        // Update waveform data
+        let waveformCount = min(200, count)
+        leftWaveform = Array(UnsafeBufferPointer(start: leftBuf, count: waveformCount))
+        rightWaveform = Array(UnsafeBufferPointer(start: rightBuf, count: waveformCount))
+
+        // Update phase scope points (downsample to 60 points)
+        let step = max(waveformCount / 60, 1)
+        phasePoints = stride(from: 0, to: waveformCount, by: step).map { i in
+            (x: leftBuf[i], y: rightBuf[i])
+        }
+
+        // Update L/R levels with smoothing
+        var leftRms: Float = 0, rightRms: Float = 0
+        vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
+        vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
+
+        let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
+        let scaledRight = min(rightRms * 4.0 * gain, 1.0)
+
+        let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
+        let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
+        leftLevel += attackL * (scaledLeft - leftLevel)
+        rightLevel += attackR * (scaledRight - rightLevel)
+    }
 
     /// Lightweight update — only L/R levels for meter bars when viz is paused
     private func updateLevelsOnly() {
@@ -451,17 +532,27 @@ class AudioMonitor {
         spectrogramFrames.removeAll()
         spectrogramWriteIdx = 0
         spectrogramCount = 0
-        spectrogramPixels.removeAll()
         spectrogramImage = nil
+    }
+
+    func enableSpectrogram() {
+        spectrogramEnabled = true
+        clearSpectrogram()
+    }
+
+    func disableSpectrogram() {
+        spectrogramEnabled = false
+        clearSpectrogram()
     }
 
     func pauseVisualizations() {
         visualizationsPaused = true
+        disableSpectrogram()
     }
 
     func resumeVisualizations() {
         visualizationsPaused = false
-        clearSpectrogram()
+        enableSpectrogram()
     }
 
     private func updateVisualizationData() {
@@ -495,14 +586,33 @@ class AudioMonitor {
         leftLevel += attackL * (scaledLeft - leftLevel)
         rightLevel += attackR * (scaledRight - rightLevel)
 
-        // FFT → spectrogram
-        if count >= fftSize {
+        // FFT → spectrogram (only if enabled, lightweight computation)
+        if spectrogramEnabled && count >= fftSize {
             if fftSetup == nil {
                 fftSetup = vDSP_create_fftsetup(fftLog2N, FFTRadix(kFFTRadix2))
             }
 
             if let setup = fftSetup {
-                let spectrum = computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup)
+                var spectrum = computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup)
+
+                // Temporal smoothing: blend 25% of previous frame for flicker-free, low-CPU animation
+                if spectrogramFrames.count > 0 {
+                    let prevIdx = (spectrogramWriteIdx - 1 + spectrogramMaxFrames) % max(spectrogramFrames.count, 1)
+                    if prevIdx < spectrogramFrames.count {
+                        let prevSpectrum = spectrogramFrames[prevIdx]
+                        // Vectorized blend using Accelerate (with temporary buffer to avoid overlapping access)
+                        let blendCount = min(spectrum.count, prevSpectrum.count)
+                        var alpha: Float = 0.75  // Current frame weight
+                        var beta: Float = 0.25   // Previous frame weight
+
+                        var currentWeighted = [Float](repeating: 0, count: blendCount)
+                        var prevWeighted = [Float](repeating: 0, count: blendCount)
+
+                        vDSP_vsmul(spectrum, 1, &alpha, &currentWeighted, 1, vDSP_Length(blendCount))
+                        vDSP_vsmul(prevSpectrum, 1, &beta, &prevWeighted, 1, vDSP_Length(blendCount))
+                        vDSP_vadd(currentWeighted, 1, prevWeighted, 1, &spectrum, 1, vDSP_Length(blendCount))
+                    }
+                }
 
                 // Circular buffer write — O(1), no array shifting
                 if spectrogramFrames.count < spectrogramMaxFrames {
@@ -513,70 +623,102 @@ class AudioMonitor {
                 spectrogramWriteIdx = (spectrogramWriteIdx + 1) % spectrogramMaxFrames
                 spectrogramCount = min(spectrogramCount + 1, spectrogramMaxFrames)
 
-                // Render spectrogram to bitmap image
-                spectrogramImage = renderSpectrogramImage()
+                // Offload rendering to background thread (non-blocking)
+                // Skip if previous render still in progress (graceful backpressure)
+                if !isRenderingSpectrogram {
+                    isRenderingSpectrogram = true
+
+                    // Capture current state for thread-safe rendering
+                    let framesToRender = spectrogramFrames
+                    let writeIdx = spectrogramWriteIdx
+                    let frameCount = spectrogramCount
+                    let sampleRate = captureSampleRate
+
+                    spectrogramQueue.async { [weak self] in
+                        guard let self = self else { return }
+
+                        // Render on background thread (CPU-intensive work)
+                        let image = self.renderSpectrogramImageOffline(
+                            frames: framesToRender,
+                            writeIdx: writeIdx,
+                            count: frameCount,
+                            sampleRate: sampleRate
+                        )
+
+                        // Update image on main thread
+                        DispatchQueue.main.async {
+                            self.spectrogramImage = image
+                            self.isRenderingSpectrogram = false
+                        }
+                    }
+                }
             }
         }
     }
 
-    // Reusable pixel buffer — avoids allocation every frame
-    private var spectrogramPixels: [UInt8] = []
+    // Pre-computed lookup table for fast color mapping (256 entries) - static to avoid Observable macro conflict
+    private static let colorLUT: [(UInt8, UInt8, UInt8)] = {
+        return (0..<256).map { i in
+            let magnitude = Float(i) / 255.0
+            return AudioMonitor.spectrogramRGBStatic(magnitude: magnitude)
+        }
+    }()
 
-    /// Renders spectrogram data into a CGImage — single image blit instead of thousands of Canvas rects.
-    private func renderSpectrogramImage() -> CGImage? {
-        let width = spectrogramCount
+    /// Thread-safe offline rendering with captured state
+    private func renderSpectrogramImageOffline(frames: [[Float]], writeIdx: Int, count: Int, sampleRate: Double) -> CGImage? {
+        let width = count
         let height = spectrogramLogRows
         guard width > 0 else { return nil }
 
-        let nyquist = captureSampleRate / 2.0
+        let nyquist = sampleRate / 2.0
         let logMin = log(spectrogramMinFreq)
         let logMax = log(spectrogramMaxFreq)
         let logRange = logMax - logMin
-        let totalBins = spectrogramFrames.first?.count ?? 512
+        let totalBins = frames.first?.count ?? 512
 
-        // Reuse pixel buffer, resize only if needed
-        let pixelCount = width * height * 4
-        if spectrogramPixels.count != pixelCount {
-            spectrogramPixels = [UInt8](repeating: 0, count: pixelCount)
-        } else {
-            spectrogramPixels.withUnsafeMutableBufferPointer { buf in
-                memset(buf.baseAddress!, 0, pixelCount)
-            }
-        }
+        // Allocate pixel buffer for this render
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
 
         // Read frames in chronological order from circular buffer
-        let startIdx = spectrogramCount < spectrogramMaxFrames ? 0 : spectrogramWriteIdx
+        let startIdx = count < spectrogramMaxFrames ? 0 : writeIdx
 
-        for col in 0..<width {
-            let frameIdx = (startIdx + col) % spectrogramFrames.count
-            let spectrum = spectrogramFrames[frameIdx]
+        pixels.withUnsafeMutableBufferPointer { pixelBuffer in
+            guard let pixelPtr = pixelBuffer.baseAddress else { return }
 
-            for row in 0..<height {
-                let logFreq = logMin + logRange * Double(row) / Double(height)
-                let freq = exp(logFreq)
-                let bin = freq / nyquist * Double(totalBins)
-                let binIdx = Int(bin)
+            for col in 0..<width {
+                let frameIdx = (startIdx + col) % frames.count
+                guard frameIdx < frames.count else { continue }
+                let spectrum = frames[frameIdx]
 
-                guard binIdx >= 0, binIdx < spectrum.count else { continue }
+                for row in 0..<height {
+                    let logFreq = logMin + logRange * Double(row) / Double(height)
+                    let freq = exp(logFreq)
+                    let bin = freq / nyquist * Double(totalBins)
+                    let binIdx = Int(bin)
 
-                let frac = Float(bin - Double(binIdx))
-                let val0 = spectrum[binIdx]
-                let val1 = binIdx + 1 < spectrum.count ? spectrum[binIdx + 1] : val0
-                let magnitude = val0 + frac * (val1 - val0)
+                    guard binIdx >= 0, binIdx < spectrum.count else { continue }
 
-                let (r, g, b) = spectrogramRGB(magnitude: magnitude)
+                    let frac = Float(bin - Double(binIdx))
+                    let val0 = spectrum[binIdx]
+                    let val1 = binIdx + 1 < spectrum.count ? spectrum[binIdx + 1] : val0
+                    let magnitude = val0 + frac * (val1 - val0)
 
-                let pixelRow = height - 1 - row
-                let idx = (pixelRow * width + col) * 4
-                spectrogramPixels[idx]     = r
-                spectrogramPixels[idx + 1] = g
-                spectrogramPixels[idx + 2] = b
-                spectrogramPixels[idx + 3] = 255
+                    // Fast lookup table access
+                    let lutIdx = Int(min(magnitude * 255, 255))
+                    let (r, g, b) = Self.colorLUT[lutIdx]
+
+                    let pixelRow = height - 1 - row
+                    let idx = (pixelRow * width + col) * 4
+                    pixelPtr[idx] = r
+                    pixelPtr[idx + 1] = g
+                    pixelPtr[idx + 2] = b
+                    pixelPtr[idx + 3] = 255
+                }
             }
         }
 
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        return spectrogramPixels.withUnsafeBufferPointer { buf in
+        return pixels.withUnsafeBufferPointer { buf in
             guard let provider = CGDataProvider(data: Data(buffer: buf) as CFData) else { return nil }
 
             return CGImage(
@@ -586,33 +728,75 @@ class AudioMonitor {
                 space: colorSpace,
                 bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                 provider: provider,
-                decode: nil, shouldInterpolate: true,
+                decode: nil, shouldInterpolate: false,
                 intent: .defaultIntent
             )
         }
     }
 
-    private func spectrogramRGB(magnitude: Float) -> (UInt8, UInt8, UInt8) {
+
+    private static func spectrogramRGBStatic(magnitude: Float) -> (UInt8, UInt8, UInt8) {
         let c = min(max(magnitude, 0), 1)
 
+        // Smooth gradient color mapping: black → blue → cyan → green → yellow → orange → red
+        // Using smooth polynomial interpolation for natural transitions
         let r: Float, g: Float, b: Float
-        if c < 0.15 {
-            r = 0; g = 0; b = c / 0.15 * 0.5
-        } else if c < 0.35 {
-            let t = (c - 0.15) / 0.2
-            r = 0; g = 0; b = 0.5 + t * 0.5
-        } else if c < 0.55 {
-            let t = (c - 0.35) / 0.2
-            r = 0; g = t; b = 1
+
+        if c < 0.125 {
+            // Black → dark blue
+            let t = c / 0.125
+            let t2 = t * t
+            r = 0
+            g = 0
+            b = 0.4 * t2
+        } else if c < 0.25 {
+            // Dark blue → bright blue
+            let t = (c - 0.125) / 0.125
+            let t2 = t * t
+            r = 0
+            g = 0
+            b = 0.4 + 0.6 * t2
+        } else if c < 0.375 {
+            // Blue → cyan
+            let t = (c - 0.25) / 0.125
+            let t2 = t * t
+            r = 0
+            g = t2
+            b = 1
+        } else if c < 0.5 {
+            // Cyan → cyan-green
+            let t = (c - 0.375) / 0.125
+            r = 0
+            g = 1
+            b = 1 - 0.3 * t * t
+        } else if c < 0.625 {
+            // Cyan-green → green
+            let t = (c - 0.5) / 0.125
+            let t2 = t * t
+            r = 0
+            g = 1
+            b = 0.7 - 0.7 * t2
         } else if c < 0.75 {
-            let t = (c - 0.55) / 0.2
-            r = t; g = 1; b = 1 - t
-        } else if c < 0.9 {
-            let t = (c - 0.75) / 0.15
-            r = 1; g = 1 - t * 0.7; b = 0
+            // Green → yellow
+            let t = (c - 0.625) / 0.125
+            let t2 = t * t
+            r = t2
+            g = 1
+            b = 0
+        } else if c < 0.875 {
+            // Yellow → orange
+            let t = (c - 0.75) / 0.125
+            let t2 = t * t
+            r = 1
+            g = 1 - 0.5 * t2
+            b = 0
         } else {
-            let t = (c - 0.9) / 0.1
-            r = 1; g = 0.3 - t * 0.3; b = 0
+            // Orange → red
+            let t = (c - 0.875) / 0.125
+            let t2 = t * t
+            r = 1
+            g = 0.5 - 0.5 * t2
+            b = 0
         }
 
         return (UInt8(r * 255), UInt8(g * 255), UInt8(b * 255))
@@ -664,8 +848,10 @@ class AudioMonitor {
     }
 
     private func stopUIUpdateTimer() {
-        uiUpdateTimer?.invalidate()
-        uiUpdateTimer = nil
+        if let displayLink = displayLink {
+            CVDisplayLinkStop(displayLink)
+            self.displayLink = nil
+        }
     }
 
     // MARK: - Auto-Gain

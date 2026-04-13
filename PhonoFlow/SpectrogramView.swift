@@ -49,7 +49,7 @@ struct SpectrogramView: View {
                     if let image = spectrogramImage {
                         Image(decorative: image, scale: 1)
                             .resizable()
-                            .interpolation(.none)
+                            .interpolation(.high)
                             .cornerRadius(6)
                     } else {
                         Text("No signal")
@@ -132,12 +132,14 @@ struct SpectrogramView: View {
             LinearGradient(
                 colors: [
                     Color(red: 0, green: 0, blue: 0),
-                    Color(red: 0, green: 0, blue: 0.5),
+                    Color(red: 0, green: 0, blue: 0.4),
                     Color(red: 0, green: 0, blue: 1),
                     Color(red: 0, green: 1, blue: 1),
+                    Color(red: 0, green: 1, blue: 0.7),
                     Color(red: 0, green: 1, blue: 0),
                     Color(red: 1, green: 1, blue: 0),
-                    Color(red: 1, green: 0.3, blue: 0),
+                    Color(red: 1, green: 0.5, blue: 0),
+                    Color(red: 1, green: 0, blue: 0),
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
