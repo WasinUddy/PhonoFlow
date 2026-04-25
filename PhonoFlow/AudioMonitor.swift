@@ -30,6 +30,38 @@ private enum AudioConfig {
     static let driftTarget = 1024  // ~23 ms at 44.1 kHz — tighter for lower latency
     static let driftThreshold = 128 // correct drift early and often
     static let targetBufferFrames: UInt32 = 256
+
+    // Declicker: per-channel scratch history (samples). Lookahead introduces tiny delay.
+    static let declickHistory = 64        // ~1.5 ms at 44.1 kHz
+    static let declickLookahead = 32      // ~0.7 ms — imperceptible, allows interpolation
+    static let declickMaxClickWidth = 24  // max ~0.5 ms wide click to repair
+}
+
+// MARK: - Declicker Strength
+
+enum DeclickStrength: Int, CaseIterable, Identifiable {
+    case light = 0
+    case medium = 1
+    case strong = 2
+
+    var id: Int { rawValue }
+
+    var label: String {
+        switch self {
+        case .light:  return "Light"
+        case .medium: return "Medium"
+        case .strong: return "Strong"
+        }
+    }
+
+    /// Lower threshold = more aggressive detection. Multiplier of running envelope.
+    var threshold: Float {
+        switch self {
+        case .light:  return 5.0   // only obvious pops
+        case .medium: return 3.5   // typical vinyl dust
+        case .strong: return 2.5   // catches subtle crackle, may shave transients
+        }
+    }
 }
 
 // MARK: - Audio Monitor
@@ -55,6 +87,15 @@ class AudioMonitor {
         }
     }
 
+    /// Real-time vinyl click/pop removal (Pro mode).
+    var isDeclickEnabled: Bool = false {
+        didSet { sharedState.setDeclickEnabled(isDeclickEnabled) }
+    }
+
+    var declickStrength: DeclickStrength = .medium {
+        didSet { sharedState.setDeclickStrength(declickStrength) }
+    }
+
     // Visualization data
     var leftWaveform: [Float] = Array(repeating: 0, count: 200)
     var rightWaveform: [Float] = Array(repeating: 0, count: 200)
@@ -64,12 +105,27 @@ class AudioMonitor {
     var spectrogramImage: CGImage?
     var spectrogramEnabled: Bool = false
 
-    // Internal spectrogram circular buffer (avoids O(n) removeFirst)
-    // 90 frames at 24fps = 3.75 seconds of history
+    // Internal spectrogram circular buffer — flat contiguous storage to avoid
+    // the per-frame deep copy that an [[Float]] would incur when handing data to
+    // the background render queue. Layout: row-major, [maxFrames][binsPerFrame].
+    // 90 frames at ~20fps = ~4.5s of history.
     private let spectrogramMaxFrames = 90
-    private var spectrogramFrames: [[Float]] = []
+    private let spectrogramBinsPerFrame = 512  // fftSize / 2
+    private var spectrogramBuffer: UnsafeMutablePointer<Float>?
+    // A single render-side scratch buffer the background queue draws from.
+    // We snapshot into this under the write index, then unblock the audio path.
+    private var spectrogramSnapshot: UnsafeMutablePointer<Float>?
     private var spectrogramWriteIdx = 0
     private var spectrogramCount = 0
+
+    // Pre-allocated FFT scratch buffers (avoid per-frame [Float] allocations).
+    private var fftRealBuf: UnsafeMutablePointer<Float>?
+    private var fftImagBuf: UnsafeMutablePointer<Float>?
+    private var fftMagBuf: UnsafeMutablePointer<Float>?
+
+    // Pre-allocated pixel buffer for the spectrogram CGImage. Sized for the
+    // largest possible image (maxFrames × spectrogramLogRows × 4 bytes RGBA).
+    private var spectrogramPixels: UnsafeMutablePointer<UInt8>?
 
     // Background rendering queue (prevent UI thread blocking)
     private let spectrogramQueue = DispatchQueue(label: "com.phonoflow.spectrogram", qos: .userInitiated)
@@ -447,8 +503,10 @@ class AudioMonitor {
 
         // Skip expensive viz work when app is collapsed
         if !visualizationsPaused {
-            // Update spectrogram at 24fps (cinema-smooth, low CPU)
-            let shouldUpdateSpectrogram = spectrogramEnabled && (timeSinceSpectrogram >= (1.0 / 24.0))
+            // Update spectrogram at 20fps — smooth enough visually, but cuts
+            // FFT/render workload by ~17% vs 24fps. The 50ms cadence also gives
+            // the audio thread more headroom when recording is active.
+            let shouldUpdateSpectrogram = spectrogramEnabled && (timeSinceSpectrogram >= (1.0 / 20.0))
 
             if shouldUpdateSpectrogram {
                 lastSpectrogramUpdate = now
@@ -529,7 +587,10 @@ class AudioMonitor {
 
     /// Clear spectrogram history and resume fresh
     func clearSpectrogram() {
-        spectrogramFrames.removeAll()
+        if let buf = spectrogramBuffer {
+            let total = spectrogramMaxFrames * spectrogramBinsPerFrame
+            buf.update(repeating: 0, count: total)
+        }
         spectrogramWriteIdx = 0
         spectrogramCount = 0
         spectrogramImage = nil
@@ -588,71 +649,93 @@ class AudioMonitor {
 
         // FFT → spectrogram (only if enabled, lightweight computation)
         if spectrogramEnabled && count >= fftSize {
+            ensureSpectrogramBuffersAllocated()
             if fftSetup == nil {
                 fftSetup = vDSP_create_fftsetup(fftLog2N, FFTRadix(kFFTRadix2))
             }
 
-            if let setup = fftSetup {
-                var spectrum = computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup)
+            guard let setup = fftSetup,
+                  let ringBuf = spectrogramBuffer,
+                  let snapshotBuf = spectrogramSnapshot,
+                  let magBuf = fftMagBuf else { return }
 
-                // Temporal smoothing: blend 25% of previous frame for flicker-free, low-CPU animation
-                if spectrogramFrames.count > 0 {
-                    let prevIdx = (spectrogramWriteIdx - 1 + spectrogramMaxFrames) % max(spectrogramFrames.count, 1)
-                    if prevIdx < spectrogramFrames.count {
-                        let prevSpectrum = spectrogramFrames[prevIdx]
-                        // Vectorized blend using Accelerate (with temporary buffer to avoid overlapping access)
-                        let blendCount = min(spectrum.count, prevSpectrum.count)
-                        var alpha: Float = 0.75  // Current frame weight
-                        var beta: Float = 0.25   // Previous frame weight
+            let bins = spectrogramBinsPerFrame
+            let writeRow = ringBuf.advanced(by: spectrogramWriteIdx * bins)
 
-                        var currentWeighted = [Float](repeating: 0, count: blendCount)
-                        var prevWeighted = [Float](repeating: 0, count: blendCount)
+            // Compute FFT magnitude directly into the ring buffer slot.
+            computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup, output: writeRow)
 
-                        vDSP_vsmul(spectrum, 1, &alpha, &currentWeighted, 1, vDSP_Length(blendCount))
-                        vDSP_vsmul(prevSpectrum, 1, &beta, &prevWeighted, 1, vDSP_Length(blendCount))
-                        vDSP_vadd(currentWeighted, 1, prevWeighted, 1, &spectrum, 1, vDSP_Length(blendCount))
-                    }
-                }
+            // Temporal smoothing: blend 25% of previous frame in-place using vDSP.
+            // No temporary [Float] allocations.
+            if spectrogramCount > 0 {
+                let prevIdx = (spectrogramWriteIdx - 1 + spectrogramMaxFrames) % spectrogramMaxFrames
+                let prevRow = ringBuf.advanced(by: prevIdx * bins)
+                var alpha: Float = 0.75
+                var beta: Float = 0.25
+                vDSP_vsmul(writeRow, 1, &alpha, magBuf, 1, vDSP_Length(bins))
+                vDSP_vsma(prevRow, 1, &beta, magBuf, 1, writeRow, 1, vDSP_Length(bins))
+            }
 
-                // Circular buffer write — O(1), no array shifting
-                if spectrogramFrames.count < spectrogramMaxFrames {
-                    spectrogramFrames.append(spectrum)
-                } else {
-                    spectrogramFrames[spectrogramWriteIdx] = spectrum
-                }
-                spectrogramWriteIdx = (spectrogramWriteIdx + 1) % spectrogramMaxFrames
-                spectrogramCount = min(spectrogramCount + 1, spectrogramMaxFrames)
+            spectrogramWriteIdx = (spectrogramWriteIdx + 1) % spectrogramMaxFrames
+            spectrogramCount = min(spectrogramCount + 1, spectrogramMaxFrames)
 
-                // Offload rendering to background thread (non-blocking)
-                // Skip if previous render still in progress (graceful backpressure)
-                if !isRenderingSpectrogram {
-                    isRenderingSpectrogram = true
+            // Offload rendering to background thread (non-blocking).
+            // Skip if previous render still in progress (graceful backpressure).
+            if !isRenderingSpectrogram {
+                isRenderingSpectrogram = true
 
-                    // Capture current state for thread-safe rendering
-                    let framesToRender = spectrogramFrames
-                    let writeIdx = spectrogramWriteIdx
-                    let frameCount = spectrogramCount
-                    let sampleRate = captureSampleRate
+                // Snapshot the ring into a separate buffer so the audio path
+                // can keep writing while rendering proceeds. memcpy is far
+                // cheaper than copying [[Float]] (~180KB of pointer-heavy data).
+                let totalFloats = spectrogramMaxFrames * bins
+                memcpy(snapshotBuf, ringBuf, totalFloats * MemoryLayout<Float>.stride)
 
-                    spectrogramQueue.async { [weak self] in
-                        guard let self = self else { return }
+                let writeIdx = spectrogramWriteIdx
+                let frameCount = spectrogramCount
+                let sampleRate = captureSampleRate
 
-                        // Render on background thread (CPU-intensive work)
-                        let image = self.renderSpectrogramImageOffline(
-                            frames: framesToRender,
-                            writeIdx: writeIdx,
-                            count: frameCount,
-                            sampleRate: sampleRate
-                        )
-
-                        // Update image on main thread
-                        DispatchQueue.main.async {
-                            self.spectrogramImage = image
-                            self.isRenderingSpectrogram = false
-                        }
+                spectrogramQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    let image = self.renderSpectrogramImageOffline(
+                        snapshot: snapshotBuf,
+                        bins: bins,
+                        writeIdx: writeIdx,
+                        count: frameCount,
+                        sampleRate: sampleRate
+                    )
+                    DispatchQueue.main.async {
+                        self.spectrogramImage = image
+                        self.isRenderingSpectrogram = false
                     }
                 }
             }
+        }
+    }
+
+    private func ensureSpectrogramBuffersAllocated() {
+        let bins = spectrogramBinsPerFrame
+        if spectrogramBuffer == nil {
+            let total = spectrogramMaxFrames * bins
+            let buf = UnsafeMutablePointer<Float>.allocate(capacity: total)
+            buf.initialize(repeating: 0, count: total)
+            spectrogramBuffer = buf
+
+            let snap = UnsafeMutablePointer<Float>.allocate(capacity: total)
+            snap.initialize(repeating: 0, count: total)
+            spectrogramSnapshot = snap
+        }
+        if fftRealBuf == nil {
+            fftRealBuf = .allocate(capacity: bins)
+            fftRealBuf?.initialize(repeating: 0, count: bins)
+            fftImagBuf = .allocate(capacity: bins)
+            fftImagBuf?.initialize(repeating: 0, count: bins)
+            fftMagBuf = .allocate(capacity: bins)
+            fftMagBuf?.initialize(repeating: 0, count: bins)
+        }
+        if spectrogramPixels == nil {
+            let pxCount = spectrogramMaxFrames * spectrogramLogRows * 4
+            spectrogramPixels = .allocate(capacity: pxCount)
+            spectrogramPixels?.initialize(repeating: 0, count: pxCount)
         }
     }
 
@@ -664,74 +747,100 @@ class AudioMonitor {
         }
     }()
 
-    /// Thread-safe offline rendering with captured state
-    private func renderSpectrogramImageOffline(frames: [[Float]], writeIdx: Int, count: Int, sampleRate: Double) -> CGImage? {
-        let width = count
-        let height = spectrogramLogRows
-        guard width > 0 else { return nil }
+    // Per-row bin index/fraction lookup. Computed once for the active sample
+    // rate so the inner render loop becomes a tight pixel-emit loop.
+    private var renderRowBinIdx: [Int] = []
+    private var renderRowBinFrac: [Float] = []
+    private var renderCachedSampleRate: Double = 0
 
+    private func ensureRenderRowTablesUpToDate(sampleRate: Double) {
+        if renderCachedSampleRate == sampleRate, renderRowBinIdx.count == spectrogramLogRows {
+            return
+        }
+        let height = spectrogramLogRows
         let nyquist = sampleRate / 2.0
         let logMin = log(spectrogramMinFreq)
         let logMax = log(spectrogramMaxFreq)
         let logRange = logMax - logMin
-        let totalBins = frames.first?.count ?? 512
+        let totalBins = spectrogramBinsPerFrame
 
-        // Allocate pixel buffer for this render
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        var idxs = [Int](repeating: 0, count: height)
+        var fracs = [Float](repeating: 0, count: height)
+        for row in 0..<height {
+            let logFreq = logMin + logRange * Double(row) / Double(height)
+            let freq = exp(logFreq)
+            let bin = freq / nyquist * Double(totalBins)
+            let binIdx = Int(bin)
+            idxs[row] = binIdx
+            fracs[row] = Float(bin - Double(binIdx))
+        }
+        renderRowBinIdx = idxs
+        renderRowBinFrac = fracs
+        renderCachedSampleRate = sampleRate
+    }
 
-        // Read frames in chronological order from circular buffer
+    /// Thread-safe offline rendering using the pre-allocated snapshot buffer.
+    private func renderSpectrogramImageOffline(
+        snapshot: UnsafeMutablePointer<Float>,
+        bins: Int,
+        writeIdx: Int,
+        count: Int,
+        sampleRate: Double
+    ) -> CGImage? {
+        let width = count
+        let height = spectrogramLogRows
+        guard width > 0, let pixelPtr = spectrogramPixels else { return nil }
+
+        ensureRenderRowTablesUpToDate(sampleRate: sampleRate)
+        let rowIdxs = renderRowBinIdx
+        let rowFracs = renderRowBinFrac
+
+        // Chronological start: when the ring is full, begin at the slot we're
+        // about to overwrite (oldest); otherwise start at 0.
         let startIdx = count < spectrogramMaxFrames ? 0 : writeIdx
 
-        pixels.withUnsafeMutableBufferPointer { pixelBuffer in
-            guard let pixelPtr = pixelBuffer.baseAddress else { return }
+        for col in 0..<width {
+            let frameIdx = (startIdx + col) % spectrogramMaxFrames
+            let spectrum = snapshot.advanced(by: frameIdx * bins)
 
-            for col in 0..<width {
-                let frameIdx = (startIdx + col) % frames.count
-                guard frameIdx < frames.count else { continue }
-                let spectrum = frames[frameIdx]
+            for row in 0..<height {
+                let binIdx = rowIdxs[row]
+                guard binIdx >= 0, binIdx < bins else { continue }
+                let frac = rowFracs[row]
+                let val0 = spectrum[binIdx]
+                let val1 = binIdx + 1 < bins ? spectrum[binIdx + 1] : val0
+                let magnitude = val0 + frac * (val1 - val0)
 
-                for row in 0..<height {
-                    let logFreq = logMin + logRange * Double(row) / Double(height)
-                    let freq = exp(logFreq)
-                    let bin = freq / nyquist * Double(totalBins)
-                    let binIdx = Int(bin)
+                let lutIdx = Int(min(max(magnitude, 0) * 255, 255))
+                let (r, g, b) = Self.colorLUT[lutIdx]
 
-                    guard binIdx >= 0, binIdx < spectrum.count else { continue }
-
-                    let frac = Float(bin - Double(binIdx))
-                    let val0 = spectrum[binIdx]
-                    let val1 = binIdx + 1 < spectrum.count ? spectrum[binIdx + 1] : val0
-                    let magnitude = val0 + frac * (val1 - val0)
-
-                    // Fast lookup table access
-                    let lutIdx = Int(min(magnitude * 255, 255))
-                    let (r, g, b) = Self.colorLUT[lutIdx]
-
-                    let pixelRow = height - 1 - row
-                    let idx = (pixelRow * width + col) * 4
-                    pixelPtr[idx] = r
-                    pixelPtr[idx + 1] = g
-                    pixelPtr[idx + 2] = b
-                    pixelPtr[idx + 3] = 255
-                }
+                let pixelRow = height - 1 - row
+                let idx = (pixelRow * width + col) * 4
+                pixelPtr[idx] = r
+                pixelPtr[idx + 1] = g
+                pixelPtr[idx + 2] = b
+                pixelPtr[idx + 3] = 255
             }
         }
 
+        // Wrap the pre-allocated buffer in CFData by copying once into a
+        // CFData-managed allocation. We can't hand CGImage a non-owned pointer
+        // safely because the next render will mutate it.
+        let byteCount = width * height * 4
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        return pixels.withUnsafeBufferPointer { buf in
-            guard let provider = CGDataProvider(data: Data(buffer: buf) as CFData) else { return nil }
+        let data = Data(bytes: pixelPtr, count: byteCount)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
 
-            return CGImage(
-                width: width, height: height,
-                bitsPerComponent: 8, bitsPerPixel: 32,
-                bytesPerRow: width * 4,
-                space: colorSpace,
-                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                provider: provider,
-                decode: nil, shouldInterpolate: false,
-                intent: .defaultIntent
-            )
-        }
+        return CGImage(
+            width: width, height: height,
+            bitsPerComponent: 8, bitsPerPixel: 32,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+            provider: provider,
+            decode: nil, shouldInterpolate: false,
+            intent: .defaultIntent
+        )
     }
 
 
@@ -802,40 +911,39 @@ class AudioMonitor {
         return (UInt8(r * 255), UInt8(g * 255), UInt8(b * 255))
     }
 
-    private func computeFFTSpectrum(samples: UnsafePointer<Float>, count: Int, setup: FFTSetup) -> [Float] {
+    /// Compute normalized FFT magnitude spectrum (in dB, 0..1) directly into
+    /// `output`. Uses pre-allocated scratch buffers — no per-frame allocations.
+    private func computeFFTSpectrum(
+        samples: UnsafePointer<Float>,
+        count: Int,
+        setup: FFTSetup,
+        output: UnsafeMutablePointer<Float>
+    ) {
         let halfSize = count / 2
+        guard let realBuf = fftRealBuf, let imagBuf = fftImagBuf else { return }
 
-        var realp = [Float](repeating: 0, count: halfSize)
-        var imagp = [Float](repeating: 0, count: halfSize)
+        var split = DSPSplitComplex(realp: realBuf, imagp: imagBuf)
 
-        return realp.withUnsafeMutableBufferPointer { realBuffer in
-            imagp.withUnsafeMutableBufferPointer { imagBuffer in
-                var output = DSPSplitComplex(realp: realBuffer.baseAddress!, imagp: imagBuffer.baseAddress!)
+        samples.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) { complexSamples in
+            vDSP_ctoz(complexSamples, 2, &split, 1, vDSP_Length(halfSize))
+        }
 
-                // Convert samples to split complex format
-                samples.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) { complexSamples in
-                    vDSP_ctoz(complexSamples, 2, &output, 1, vDSP_Length(halfSize))
-                }
+        vDSP_fft_zrip(setup, &split, 1, fftLog2N, FFTDirection(FFT_FORWARD))
 
-                // Perform FFT
-                vDSP_fft_zrip(setup, &output, 1, fftLog2N, FFTDirection(FFT_FORWARD))
+        // |z| → output, then scale and convert to normalized dB in-place.
+        vDSP_zvabs(&split, 1, output, 1, vDSP_Length(halfSize))
+        var scale: Float = 2.0 / Float(count)
+        vDSP_vsmul(output, 1, &scale, output, 1, vDSP_Length(halfSize))
 
-                // Compute magnitude and normalize by FFT size
-                var magnitudes = [Float](repeating: 0, count: halfSize)
-                vDSP_zvabs(&output, 1, &magnitudes, 1, vDSP_Length(halfSize))
-
-                let scale = 2.0 / Float(count)  // Proper FFT amplitude normalization
-                vDSP_vsmul(magnitudes, 1, [scale], &magnitudes, 1, vDSP_Length(halfSize))
-
-                // Convert to dB and normalize — 96 dB dynamic range (-96 dB to 0 dB)
-                var normalizedMagnitudes = [Float](repeating: 0, count: halfSize)
-                for i in 0..<halfSize {
-                    let db = 20 * log10(max(magnitudes[i], 1e-10))
-                    normalizedMagnitudes[i] = max(0, min(1, (db + 96) / 96))
-                }
-
-                return normalizedMagnitudes
-            }
+        // Convert to dB (0..1, -96 dB floor). vDSP_vdbcon expects a 1.0 reference;
+        // we follow with a vsadd + vsmul + clip to map -96..0 dB → 0..1.
+        // Doing the loop manually here is competitive and avoids extra passes.
+        let invRange: Float = 1.0 / 96.0
+        for i in 0..<halfSize {
+            let db = 20 * log10(max(output[i], 1e-10))
+            var v = (db + 96) * invRange
+            if v < 0 { v = 0 } else if v > 1 { v = 1 }
+            output[i] = v
         }
     }
 
@@ -845,6 +953,12 @@ class AudioMonitor {
         }
         vizLeftBuf.deallocate()
         vizRightBuf.deallocate()
+        spectrogramBuffer?.deallocate()
+        spectrogramSnapshot?.deallocate()
+        fftRealBuf?.deallocate()
+        fftImagBuf?.deallocate()
+        fftMagBuf?.deallocate()
+        spectrogramPixels?.deallocate()
     }
 
     private func stopUIUpdateTimer() {
@@ -1009,6 +1123,18 @@ private class SharedAudioState {
     var dcRightPrevY: Float = 0
     var dcFilterR: Float = 0.9972
 
+    // Declicker state — owned by audio thread. Atomic flags for enable/strength.
+    private var _declickEnabled: Bool = false
+    private var _declickThreshold: Float = DeclickStrength.medium.threshold
+    var declickEnvL: Float = 0  // running envelope (smoothed |sample|)
+    var declickEnvR: Float = 0
+    let declickBufL: UnsafeMutablePointer<Float>  // delay line for lookahead repair
+    let declickBufR: UnsafeMutablePointer<Float>
+    var declickWriteL: Int = 0
+    var declickWriteR: Int = 0
+    var declickFilledL: Int = 0
+    var declickFilledR: Int = 0
+
     // Pre-allocated work buffers
     private static let cap = AudioConfig.workCapacity
     let workLeft: UnsafeMutablePointer<Float>
@@ -1032,6 +1158,10 @@ private class SharedAudioState {
         eqStateL = .allocate(capacity: stateCount); eqStateL.initialize(repeating: 0, count: stateCount)
         eqStateR = .allocate(capacity: stateCount); eqStateR.initialize(repeating: 0, count: stateCount)
 
+        let declickCap = AudioConfig.declickHistory
+        declickBufL = .allocate(capacity: declickCap); declickBufL.initialize(repeating: 0, count: declickCap)
+        declickBufR = .allocate(capacity: declickCap); declickBufR.initialize(repeating: 0, count: declickCap)
+
         // Initialize all bands to unity passthrough: b0=1, rest=0
         for i in 0..<AudioConfig.eqBandCount {
             eqCoeffsStaging[i * 5] = 1.0
@@ -1045,6 +1175,24 @@ private class SharedAudioState {
         workOutL.deallocate(); workOutR.deallocate()
         eqCoeffsStaging.deallocate(); eqCoeffs.deallocate()
         eqStateL.deallocate(); eqStateR.deallocate()
+        declickBufL.deallocate(); declickBufR.deallocate()
+    }
+
+    // MARK: - Declicker Parameters
+
+    func setDeclickEnabled(_ enabled: Bool) {
+        os_unfair_lock_lock(&paramLock); _declickEnabled = enabled; os_unfair_lock_unlock(&paramLock)
+    }
+
+    func setDeclickStrength(_ s: DeclickStrength) {
+        os_unfair_lock_lock(&paramLock); _declickThreshold = s.threshold; os_unfair_lock_unlock(&paramLock)
+    }
+
+    func getDeclickParams() -> (Bool, Float) {
+        os_unfair_lock_lock(&paramLock)
+        let result = (_declickEnabled, _declickThreshold)
+        os_unfair_lock_unlock(&paramLock)
+        return result
     }
 
     // MARK: - DC Filter
@@ -1216,6 +1364,14 @@ private class SharedAudioState {
         let stateCount = AudioConfig.eqBandCount * 2
         eqStateL.initialize(repeating: 0, count: stateCount)
         eqStateR.initialize(repeating: 0, count: stateCount)
+
+        // Reset declicker delay lines
+        let declickCap = AudioConfig.declickHistory
+        declickBufL.initialize(repeating: 0, count: declickCap)
+        declickBufR.initialize(repeating: 0, count: declickCap)
+        declickWriteL = 0; declickWriteR = 0
+        declickFilledL = 0; declickFilledR = 0
+        declickEnvL = 0; declickEnvR = 0
     }
 }
 
@@ -1283,6 +1439,106 @@ private func applySoftLimiter(_ buffer: UnsafeMutablePointer<Float>, count: Int)
             let excess = absX - threshold
             buffer[i] = sign * (threshold + headroom * tanhf(excess / headroom))
         }
+    }
+}
+
+/// Real-time vinyl click/pop remover.
+///
+/// Algorithm:
+/// 1. Maintain a per-channel delay line of `declickHistory` samples.
+/// 2. For each new sample, the *output* is the sample at lag `declickLookahead`
+///    (so we have `declickLookahead` future samples available for context).
+/// 3. Track a smoothed |sample| envelope to know what "normal" loudness is.
+/// 4. If the output sample's magnitude exceeds `threshold * envelope`, treat it as
+///    the start of a click. Scan forward in the lookahead window to find where the
+///    spike returns to baseline (or hit max click width).
+/// 5. Replace click samples with linear interpolation between last-clean-before
+///    and first-clean-after (both already in the delay line).
+///
+/// Latency: `declickLookahead` samples (~0.7 ms at 44.1 kHz) — imperceptible.
+/// Cost: O(N) with a small constant; one max-scan per detected click only.
+private func processDeclick(
+    input: UnsafePointer<Float>,
+    output: UnsafeMutablePointer<Float>,
+    count: Int,
+    delay: UnsafeMutablePointer<Float>,
+    write: inout Int,
+    filled: inout Int,
+    env: inout Float,
+    threshold: Float
+) {
+    let cap = AudioConfig.declickHistory
+    let lookahead = AudioConfig.declickLookahead
+    let maxWidth = AudioConfig.declickMaxClickWidth
+
+    // Envelope smoothing coefficients (~10 ms attack/release at 44.1 kHz)
+    let envAttack: Float = 0.01
+    let envFloor: Float = 1e-4
+
+    for i in 0..<count {
+        let inSample = input[i]
+
+        // Push new sample into delay line first.
+        delay[write] = inSample
+        write = (write + 1) % cap
+        if filled < cap { filled += 1 }
+
+        // We can only output once the delay line has at least `lookahead+1` samples.
+        if filled <= lookahead {
+            output[i] = 0
+            continue
+        }
+
+        // Index of the sample we're emitting (oldest sample minus 1).
+        // Read position is the sample that lags behind `write` by `lookahead`.
+        let outIdx = (write - lookahead - 1 + cap) % cap
+        var sample = delay[outIdx]
+        let absSample = abs(sample)
+
+        // Update envelope using the *output* sample (the one being emitted now).
+        // Use slow tracking so brief clicks don't pump the envelope upward.
+        let target = max(absSample, envFloor)
+        if target > env {
+            env += envAttack * 0.25 * (target - env)  // slow attack: clicks shouldn't raise floor
+        } else {
+            env += envAttack * (target - env)         // moderate release
+        }
+
+        // Click detection: output sample wildly exceeds local envelope.
+        let detectThresh = max(threshold * env, 0.02)  // never trigger on near-silence
+        if absSample > detectThresh {
+            // Scan forward through the lookahead window to find where signal returns
+            // to baseline. width = 1 means just the current sample is bad.
+            var width = 1
+            for w in 1...min(maxWidth, lookahead) {
+                let idx = (outIdx + w) % cap
+                if abs(delay[idx]) <= detectThresh { break }
+                width = w + 1
+            }
+
+            // "Clean" anchor before the click: previous output (already written).
+            let beforeIdx = (outIdx - 1 + cap) % cap
+            let before = delay[beforeIdx]
+
+            // "Clean" anchor after: first sample past the click width.
+            let afterPos = min(width, lookahead)
+            let afterIdx = (outIdx + afterPos) % cap
+            let after = delay[afterIdx]
+
+            // Linear interpolation across the click span.
+            // Repair samples in-place in the delay line so subsequent reads see
+            // the cleaned signal (important for envelope tracking on next iter).
+            let span = Float(afterPos + 1)
+            for w in 0..<width {
+                let idx = (outIdx + w) % cap
+                let t = Float(w + 1) / span
+                delay[idx] = before + t * (after - before)
+            }
+
+            sample = delay[outIdx]
+        }
+
+        output[i] = sample
     }
 }
 
@@ -1377,6 +1633,27 @@ private func inputRenderCallback(
     state.syncEQCoefficients()
     let eqActive = state.cachedEqActive
     let gainActive = params.gain != 1.0
+
+    // Vinyl click/pop removal — runs early in the chain so EQ/limiter see clean signal
+    let (declickEnabled, declickThresh) = state.getDeclickParams()
+    if declickEnabled {
+        processDeclick(
+            input: leftBuf, output: leftBuf, count: frameCount,
+            delay: state.declickBufL,
+            write: &state.declickWriteL,
+            filled: &state.declickFilledL,
+            env: &state.declickEnvL,
+            threshold: declickThresh
+        )
+        processDeclick(
+            input: rightBuf, output: rightBuf, count: frameCount,
+            delay: state.declickBufR,
+            write: &state.declickWriteR,
+            filled: &state.declickFilledR,
+            env: &state.declickEnvR,
+            threshold: declickThresh
+        )
+    }
 
     // Clean passthrough when no processing is engaged (Audacity-style transparent wire).
     // DC filter + limiter only run when EQ is active, since EQ boosts can cause DC

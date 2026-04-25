@@ -47,9 +47,12 @@ struct SpectrogramView: View {
                         .fill(Color.primary.opacity(0.03))
 
                     if let image = spectrogramImage {
+                        // .medium gives smooth visuals without the heavy per-frame
+                        // Lanczos pass that .high triggers every redraw at 20+ fps.
                         Image(decorative: image, scale: 1)
                             .resizable()
-                            .interpolation(.high)
+                            .interpolation(.medium)
+                            .antialiased(false)
                             .cornerRadius(6)
                     } else {
                         Text("No signal")

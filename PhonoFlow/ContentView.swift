@@ -37,6 +37,10 @@ struct ContentView: View {
             // Enable metering based on mode
             audioMonitor.isMeteringEnabled = settings.isProMode
 
+            // Sync vinyl declicker settings → audio engine
+            audioMonitor.declickStrength = DeclickStrength(rawValue: settings.declickStrength) ?? .medium
+            audioMonitor.isDeclickEnabled = settings.isProMode && settings.declickEnabled
+
             if audioManager.microphonePermissionGranted {
                 audioManager.refreshDevices()
                 if !audioMonitor.isMonitoring,
@@ -89,6 +93,14 @@ struct ContentView: View {
             if !newValue, audioMonitor.isStreamingEnabled {
                 audioMonitor.stopStreaming()
             }
+            // Declicker is a Pro-only feature; disable in Basic mode.
+            audioMonitor.isDeclickEnabled = newValue && settings.declickEnabled
+        }
+        .onChange(of: settings.declickEnabled) { _, newValue in
+            audioMonitor.isDeclickEnabled = settings.isProMode && newValue
+        }
+        .onChange(of: settings.declickStrength) { _, newValue in
+            audioMonitor.declickStrength = DeclickStrength(rawValue: newValue) ?? .medium
         }
     }
 
@@ -237,6 +249,20 @@ struct ContentView: View {
 
                 sectionCard {
                     EqualizerView(eqBands: audioMonitor.eqBands, theme: theme)
+                }
+
+                sectionCard {
+                    VinylRestoreView(
+                        isEnabled: Binding(
+                            get: { settings.declickEnabled },
+                            set: { settings.declickEnabled = $0 }
+                        ),
+                        strength: Binding(
+                            get: { DeclickStrength(rawValue: settings.declickStrength) ?? .medium },
+                            set: { settings.declickStrength = $0.rawValue }
+                        ),
+                        theme: theme
+                    )
                 }
             }
 

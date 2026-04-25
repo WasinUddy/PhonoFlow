@@ -64,6 +64,8 @@ private enum SettingsKeys {
     static let launchAtLogin = "launchAtLogin"
     static let hasAskedLaunchAtLogin = "hasAskedLaunchAtLogin"
     static let showAdvancedVisualizations = "showAdvancedVisualizations"
+    static let declickEnabled = "declickEnabled"
+    static let declickStrength = "declickStrength"
 }
 
 // Shared colors used across the UI — centralised to avoid scattered literal RGB values.
@@ -119,6 +121,14 @@ class AppSettings {
         didSet { UserDefaults.standard.set(showAdvancedVisualizations, forKey: SettingsKeys.showAdvancedVisualizations) }
     }
 
+    var declickEnabled: Bool {
+        didSet { UserDefaults.standard.set(declickEnabled, forKey: SettingsKeys.declickEnabled) }
+    }
+
+    var declickStrength: Int {
+        didSet { UserDefaults.standard.set(declickStrength, forKey: SettingsKeys.declickStrength) }
+    }
+
     init() {
         let ud = UserDefaults.standard
         if let raw = ud.string(forKey: SettingsKeys.theme),
@@ -147,6 +157,11 @@ class AppSettings {
 
         // Advanced visualizations toggle (default off)
         showAdvancedVisualizations = ud.object(forKey: SettingsKeys.showAdvancedVisualizations) == nil ? false : ud.bool(forKey: SettingsKeys.showAdvancedVisualizations)
+
+        // Vinyl click/pop removal (default off, medium strength)
+        declickEnabled = ud.bool(forKey: SettingsKeys.declickEnabled)
+        let savedStrength = ud.object(forKey: SettingsKeys.declickStrength) as? Int
+        declickStrength = savedStrength ?? 1  // .medium
     }
 
     private func updateLaunchAtLogin(_ enabled: Bool) {
