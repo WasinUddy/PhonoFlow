@@ -30,38 +30,6 @@ private enum AudioConfig {
     static let driftTarget = 1024  // ~23 ms at 44.1 kHz — tighter for lower latency
     static let driftThreshold = 128 // correct drift early and often
     static let targetBufferFrames: UInt32 = 256
-
-    // Declicker: per-channel scratch history (samples). Lookahead introduces tiny delay.
-    static let declickHistory = 64        // ~1.5 ms at 44.1 kHz
-    static let declickLookahead = 32      // ~0.7 ms — imperceptible, allows interpolation
-    static let declickMaxClickWidth = 24  // max ~0.5 ms wide click to repair
-}
-
-// MARK: - Declicker Strength
-
-enum DeclickStrength: Int, CaseIterable, Identifiable {
-    case light = 0
-    case medium = 1
-    case strong = 2
-
-    var id: Int { rawValue }
-
-    var label: String {
-        switch self {
-        case .light:  return "Light"
-        case .medium: return "Medium"
-        case .strong: return "Strong"
-        }
-    }
-
-    /// Lower threshold = more aggressive detection. Multiplier of running envelope.
-    var threshold: Float {
-        switch self {
-        case .light:  return 5.0   // only obvious pops
-        case .medium: return 3.5   // typical vinyl dust
-        case .strong: return 2.5   // catches subtle crackle, may shave transients
-        }
-    }
 }
 
 // MARK: - Audio Monitor
@@ -85,15 +53,6 @@ class AudioMonitor {
                 stopAutoGain()
             }
         }
-    }
-
-    /// Real-time vinyl click/pop removal (Pro mode).
-    var isDeclickEnabled: Bool = false {
-        didSet { sharedState.setDeclickEnabled(isDeclickEnabled) }
-    }
-
-    var declickStrength: DeclickStrength = .medium {
-        didSet { sharedState.setDeclickStrength(declickStrength) }
     }
 
     // Visualization data
@@ -1123,18 +1082,6 @@ private class SharedAudioState {
     var dcRightPrevY: Float = 0
     var dcFilterR: Float = 0.9972
 
-    // Declicker state — owned by audio thread. Atomic flags for enable/strength.
-    private var _declickEnabled: Bool = false
-    private var _declickThreshold: Float = DeclickStrength.medium.threshold
-    var declickEnvL: Float = 0  // running envelope (smoothed |sample|)
-    var declickEnvR: Float = 0
-    let declickBufL: UnsafeMutablePointer<Float>  // delay line for lookahead repair
-    let declickBufR: UnsafeMutablePointer<Float>
-    var declickWriteL: Int = 0
-    var declickWriteR: Int = 0
-    var declickFilledL: Int = 0
-    var declickFilledR: Int = 0
-
     // Pre-allocated work buffers
     private static let cap = AudioConfig.workCapacity
     let workLeft: UnsafeMutablePointer<Float>
@@ -1158,10 +1105,6 @@ private class SharedAudioState {
         eqStateL = .allocate(capacity: stateCount); eqStateL.initialize(repeating: 0, count: stateCount)
         eqStateR = .allocate(capacity: stateCount); eqStateR.initialize(repeating: 0, count: stateCount)
 
-        let declickCap = AudioConfig.declickHistory
-        declickBufL = .allocate(capacity: declickCap); declickBufL.initialize(repeating: 0, count: declickCap)
-        declickBufR = .allocate(capacity: declickCap); declickBufR.initialize(repeating: 0, count: declickCap)
-
         // Initialize all bands to unity passthrough: b0=1, rest=0
         for i in 0..<AudioConfig.eqBandCount {
             eqCoeffsStaging[i * 5] = 1.0
@@ -1175,24 +1118,6 @@ private class SharedAudioState {
         workOutL.deallocate(); workOutR.deallocate()
         eqCoeffsStaging.deallocate(); eqCoeffs.deallocate()
         eqStateL.deallocate(); eqStateR.deallocate()
-        declickBufL.deallocate(); declickBufR.deallocate()
-    }
-
-    // MARK: - Declicker Parameters
-
-    func setDeclickEnabled(_ enabled: Bool) {
-        os_unfair_lock_lock(&paramLock); _declickEnabled = enabled; os_unfair_lock_unlock(&paramLock)
-    }
-
-    func setDeclickStrength(_ s: DeclickStrength) {
-        os_unfair_lock_lock(&paramLock); _declickThreshold = s.threshold; os_unfair_lock_unlock(&paramLock)
-    }
-
-    func getDeclickParams() -> (Bool, Float) {
-        os_unfair_lock_lock(&paramLock)
-        let result = (_declickEnabled, _declickThreshold)
-        os_unfair_lock_unlock(&paramLock)
-        return result
     }
 
     // MARK: - DC Filter
@@ -1364,14 +1289,6 @@ private class SharedAudioState {
         let stateCount = AudioConfig.eqBandCount * 2
         eqStateL.initialize(repeating: 0, count: stateCount)
         eqStateR.initialize(repeating: 0, count: stateCount)
-
-        // Reset declicker delay lines
-        let declickCap = AudioConfig.declickHistory
-        declickBufL.initialize(repeating: 0, count: declickCap)
-        declickBufR.initialize(repeating: 0, count: declickCap)
-        declickWriteL = 0; declickWriteR = 0
-        declickFilledL = 0; declickFilledR = 0
-        declickEnvL = 0; declickEnvR = 0
     }
 }
 
@@ -1439,106 +1356,6 @@ private func applySoftLimiter(_ buffer: UnsafeMutablePointer<Float>, count: Int)
             let excess = absX - threshold
             buffer[i] = sign * (threshold + headroom * tanhf(excess / headroom))
         }
-    }
-}
-
-/// Real-time vinyl click/pop remover.
-///
-/// Algorithm:
-/// 1. Maintain a per-channel delay line of `declickHistory` samples.
-/// 2. For each new sample, the *output* is the sample at lag `declickLookahead`
-///    (so we have `declickLookahead` future samples available for context).
-/// 3. Track a smoothed |sample| envelope to know what "normal" loudness is.
-/// 4. If the output sample's magnitude exceeds `threshold * envelope`, treat it as
-///    the start of a click. Scan forward in the lookahead window to find where the
-///    spike returns to baseline (or hit max click width).
-/// 5. Replace click samples with linear interpolation between last-clean-before
-///    and first-clean-after (both already in the delay line).
-///
-/// Latency: `declickLookahead` samples (~0.7 ms at 44.1 kHz) — imperceptible.
-/// Cost: O(N) with a small constant; one max-scan per detected click only.
-private func processDeclick(
-    input: UnsafePointer<Float>,
-    output: UnsafeMutablePointer<Float>,
-    count: Int,
-    delay: UnsafeMutablePointer<Float>,
-    write: inout Int,
-    filled: inout Int,
-    env: inout Float,
-    threshold: Float
-) {
-    let cap = AudioConfig.declickHistory
-    let lookahead = AudioConfig.declickLookahead
-    let maxWidth = AudioConfig.declickMaxClickWidth
-
-    // Envelope smoothing coefficients (~10 ms attack/release at 44.1 kHz)
-    let envAttack: Float = 0.01
-    let envFloor: Float = 1e-4
-
-    for i in 0..<count {
-        let inSample = input[i]
-
-        // Push new sample into delay line first.
-        delay[write] = inSample
-        write = (write + 1) % cap
-        if filled < cap { filled += 1 }
-
-        // We can only output once the delay line has at least `lookahead+1` samples.
-        if filled <= lookahead {
-            output[i] = 0
-            continue
-        }
-
-        // Index of the sample we're emitting (oldest sample minus 1).
-        // Read position is the sample that lags behind `write` by `lookahead`.
-        let outIdx = (write - lookahead - 1 + cap) % cap
-        var sample = delay[outIdx]
-        let absSample = abs(sample)
-
-        // Update envelope using the *output* sample (the one being emitted now).
-        // Use slow tracking so brief clicks don't pump the envelope upward.
-        let target = max(absSample, envFloor)
-        if target > env {
-            env += envAttack * 0.25 * (target - env)  // slow attack: clicks shouldn't raise floor
-        } else {
-            env += envAttack * (target - env)         // moderate release
-        }
-
-        // Click detection: output sample wildly exceeds local envelope.
-        let detectThresh = max(threshold * env, 0.02)  // never trigger on near-silence
-        if absSample > detectThresh {
-            // Scan forward through the lookahead window to find where signal returns
-            // to baseline. width = 1 means just the current sample is bad.
-            var width = 1
-            for w in 1...min(maxWidth, lookahead) {
-                let idx = (outIdx + w) % cap
-                if abs(delay[idx]) <= detectThresh { break }
-                width = w + 1
-            }
-
-            // "Clean" anchor before the click: previous output (already written).
-            let beforeIdx = (outIdx - 1 + cap) % cap
-            let before = delay[beforeIdx]
-
-            // "Clean" anchor after: first sample past the click width.
-            let afterPos = min(width, lookahead)
-            let afterIdx = (outIdx + afterPos) % cap
-            let after = delay[afterIdx]
-
-            // Linear interpolation across the click span.
-            // Repair samples in-place in the delay line so subsequent reads see
-            // the cleaned signal (important for envelope tracking on next iter).
-            let span = Float(afterPos + 1)
-            for w in 0..<width {
-                let idx = (outIdx + w) % cap
-                let t = Float(w + 1) / span
-                delay[idx] = before + t * (after - before)
-            }
-
-            sample = delay[outIdx]
-        }
-
-        output[i] = sample
     }
 }
 
@@ -1633,27 +1450,6 @@ private func inputRenderCallback(
     state.syncEQCoefficients()
     let eqActive = state.cachedEqActive
     let gainActive = params.gain != 1.0
-
-    // Vinyl click/pop removal — runs early in the chain so EQ/limiter see clean signal
-    let (declickEnabled, declickThresh) = state.getDeclickParams()
-    if declickEnabled {
-        processDeclick(
-            input: leftBuf, output: leftBuf, count: frameCount,
-            delay: state.declickBufL,
-            write: &state.declickWriteL,
-            filled: &state.declickFilledL,
-            env: &state.declickEnvL,
-            threshold: declickThresh
-        )
-        processDeclick(
-            input: rightBuf, output: rightBuf, count: frameCount,
-            delay: state.declickBufR,
-            write: &state.declickWriteR,
-            filled: &state.declickFilledR,
-            env: &state.declickEnvR,
-            threshold: declickThresh
-        )
-    }
 
     // Clean passthrough when no processing is engaged (Audacity-style transparent wire).
     // DC filter + limiter only run when EQ is active, since EQ boosts can cause DC
