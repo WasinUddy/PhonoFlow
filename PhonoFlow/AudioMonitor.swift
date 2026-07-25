@@ -13,27 +13,82 @@
 import Accelerate
 import AudioToolbox
 import CoreAudio
-import CoreVideo
+import Darwin
 import Foundation
-import os.lock
+import PhonoFlowCore
 import QuartzCore
+import Synchronization
+import os
 
 // MARK: - Configuration
 
-private enum AudioConfig {
+nonisolated private enum AudioConfig {
     static let eqBandCount = 10
+    static let eqPublicationSlotCount = 3
     static let eqFrequencies: [Float] = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-    static let eqQ: Float = 1.414 // sqrt(2), standard graphic EQ bandwidth
-    static let softLimitThreshold: Float = 0.891 // -1 dBFS
-    static let ringCapacity = 4096
+    static let eqQ: Float = 1.414  // sqrt(2), standard graphic EQ bandwidth
+    static let softLimitThreshold: Float = 0.891  // -1 dBFS
+    static let ringCapacity = 16_384
     static let workCapacity = 4096
     static let driftTarget = 1024  // ~23 ms at 44.1 kHz — tighter for lower latency
-    static let driftThreshold = 128 // correct drift early and often
+    static let driftThreshold = 128  // correct drift early and often
     static let targetBufferFrames: UInt32 = 256
+}
+
+nonisolated struct AudioRuntimeFormat: Equatable, Sendable {
+    let sampleRate: Double
+    let channelCount: Int
+    let bufferFrames: UInt32
+    let inputChannelMap: [Int32]
+
+    var summary: String {
+        let rate =
+            sampleRate >= 1_000
+            ? String(format: "%.1f kHz", sampleRate / 1_000)
+            : String(format: "%.0f Hz", sampleRate)
+        return "\(rate) · \(channelCount) ch · \(bufferFrames) frames"
+    }
+}
+
+nonisolated struct AudioEngineFailure: Error, Equatable, Identifiable, Sendable {
+    let id = UUID()
+    let operation: String
+    let status: OSStatus
+    let deviceID: AudioDeviceID?
+    let detail: String
+
+    var localizedDescription: String {
+        "\(operation): \(detail) (\(Self.statusString(status)))"
+    }
+
+    private static func statusString(_ status: OSStatus) -> String {
+        let value = UInt32(bitPattern: status)
+        let bytes: [UInt8] = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff),
+        ]
+        if bytes.allSatisfy({ $0 >= 32 && $0 <= 126 }),
+            let fourCC = String(bytes: bytes, encoding: .ascii)
+        {
+            return "'\(fourCC)'"
+        }
+        return "\(status)"
+    }
+}
+
+nonisolated enum AudioEngineStatus: Equatable, Sendable {
+    case idle
+    case starting
+    case running(AudioRuntimeFormat)
+    case disconnected
+    case failed(AudioEngineFailure)
 }
 
 // MARK: - Audio Monitor
 
+@MainActor
 @Observable
 class AudioMonitor {
     var peakLevel: Float = 0
@@ -42,11 +97,22 @@ class AudioMonitor {
     var isPassthroughEnabled = false
     var isStreamingEnabled = false
     var streamURL: String = ""
+    private(set) var engineStatus: AudioEngineStatus = .idle
+    private(set) var lastError: AudioEngineFailure?
+    private(set) var negotiatedBufferFrames: UInt32 = AudioConfig.targetBufferFrames
+    private(set) var inputChannelMap: [Int32] = [0, 1]
+    private(set) var callbackOverflowCount: UInt64 = 0
+    private(set) var playbackOverflowCount: UInt64 = 0
+    private(set) var playbackUnderrunCount: UInt64 = 0
+    private(set) var callbackCount: UInt64 = 0
+    private(set) var maximumCallbackDurationMicroseconds: Double = 0
     var isRecording = false
     var recordingDuration: Double = 0
     var recordingURL: URL?
+    private(set) var lastRecordingFailure: AudioRecorder.TerminalFailure?
     var isAutoGainEnabled: Bool = false {
         didSet {
+            guard oldValue != isAutoGainEnabled else { return }
             if isAutoGainEnabled {
                 startAutoGain()
             } else {
@@ -62,41 +128,26 @@ class AudioMonitor {
     var leftLevel: Float = 0
     var rightLevel: Float = 0
     var spectrogramImage: CGImage?
-    var spectrogramEnabled: Bool = false
-
-    // Internal spectrogram circular buffer — flat contiguous storage to avoid
-    // the per-frame deep copy that an [[Float]] would incur when handing data to
-    // the background render queue. Layout: row-major, [maxFrames][binsPerFrame].
-    // 64 frames at ~15fps = ~4.3s of history (reduced from 90@20fps for bettter perf).
-    private let spectrogramMaxFrames = 64
-    private let spectrogramBinsPerFrame = 384  // fftSize / 2 (reduced from 512 for faster FFT)
-    private var spectrogramBuffer: UnsafeMutablePointer<Float>?
-    // A single render-side scratch buffer the background queue draws from.
-    // We snapshot into this under the write index, then unblock the audio path.
-    private var spectrogramSnapshot: UnsafeMutablePointer<Float>?
-    private var spectrogramWriteIdx = 0
-    private var spectrogramCount = 0
-
-    // Pre-allocated FFT scratch buffers (avoid per-frame [Float] allocations).
-    private var fftRealBuf: UnsafeMutablePointer<Float>?
-    private var fftImagBuf: UnsafeMutablePointer<Float>?
-    private var fftMagBuf: UnsafeMutablePointer<Float>?
-
-    // Pre-allocated pixel buffer for the spectrogram CGImage. Sized for the
-    // largest possible image (maxFrames × spectrogramLogRows × 4 bytes RGBA).
-    private var spectrogramPixels: UnsafeMutablePointer<UInt8>?
-
-    // Background rendering queue (prevent UI thread blocking)
-    private let spectrogramQueue = DispatchQueue(label: "com.phonoflow.spectrogram", qos: .userInitiated)
-    private var isRenderingSpectrogram = false
+    var spectrogramEnabled: Bool = false {
+        didSet { updateAnalysisDemand() }
+    }
 
     // Pause visualizations when app is collapsed to save CPU/battery
-    var visualizationsPaused: Bool = false
+    var visualizationsPaused: Bool = false {
+        didSet { updateAnalysisDemand() }
+    }
+
+    private(set) var analysisDroppedFrameCount: UInt64 = 0
+    private(set) var fanoutDroppedFrameCount: UInt64 = 0
+    private(set) var analysisQueueDepth: Int = 0
+    private(set) var fanoutQueueDepth: Int = 0
+    private(set) var spectrogramRenderSkipCount: UInt64 = 0
+    private(set) var spectrogramImageAgeMilliseconds: Double = 0
 
     // Keep a nonisolated copy for the audio thread to read during setup
     private var lastEqBands: [Float] = Array(repeating: 0, count: AudioConfig.eqBandCount)
 
-    @MainActor var eqBands: [Float] = Array(repeating: 0, count: AudioConfig.eqBandCount) {
+    var eqBands: [Float] = Array(repeating: 0, count: AudioConfig.eqBandCount) {
         didSet {
             lastEqBands = eqBands
             sharedState.updateEQCoefficients(bands: eqBands, sampleRate: Float(captureSampleRate))
@@ -105,13 +156,41 @@ class AudioMonitor {
 
     private var inputUnit: AudioUnit?
     private var outputUnit: AudioUnit?
+    private var inputUnitStarted = false
+    private var outputUnitStarted = false
+    private var outputUnitInitialized = false
+    private var inputCallbackRefCon: UnsafeMutableRawPointer?
+    private var outputCallbackRefCon: UnsafeMutableRawPointer?
+    private var inputCallbackContext: AudioCallbackContext?
+    private var outputCallbackContext: AudioCallbackContext?
     private var inputDeviceID: AudioDeviceID = 0
-    private var outputDeviceID: AudioDeviceID = 0
+    private var outputDeviceID: AudioDeviceID?
+    private var hasActiveOutputFailure = false
 
-    private let sharedState = SharedAudioState()
-    private let streamServer = AudioStreamServer()
-    private let recorder = AudioRecorder()
+    private let audioUnitRuntime: any AudioUnitHALRuntime
+    private let pipelineWorker: AudioPipelineWorker
+    private let sharedState: SharedAudioState
+    private let recorder: AudioRecorder
     private(set) var captureSampleRate: Double = 44100
+    private var remoteSpectrumSubscribersVisible = false
+    private var remoteAudioSubscribersVisible = false
+    private var pipelineAudioFanout: RemoteAudioFanout?
+    private var pipelineRemoteServer: RemoteAccessServer?
+    private var pairedRemoteBaseURL: String?
+    private var legacyListenerBaseURL: String?
+    #if DEBUG
+        private var fakeCaptureSource: FakeCaptureSource?
+        private let acceptanceAudioBackendOverride: Bool?
+        private var shouldUseAcceptanceAudioBackend: Bool {
+            // A caller-injected HAL must remain authoritative even when the
+            // surrounding process is an acceptance-test host. The environment
+            // remains call-time configuration because acceptance tests may
+            // scope it around a single operation after creating the monitor.
+            audioUnitRuntime === SystemAudioUnitHALRuntime.shared
+                && (acceptanceAudioBackendOverride
+                    ?? FakeCaptureSource.isRequestedByEnvironment)
+        }
+    #endif
 
     var isMeteringEnabled: Bool = false {
         didSet {
@@ -119,29 +198,153 @@ class AudioMonitor {
         }
     }
 
-    func startMonitoring(deviceID: AudioDeviceID, outputDeviceID: AudioDeviceID?) {
+    init(
+        audioUnitRuntime: any AudioUnitHALRuntime =
+            SystemAudioUnitHALRuntime.shared,
+        acceptanceAudioBackendOverride: Bool? = nil,
+        recorder: AudioRecorder = AudioRecorder()
+    ) {
+        let worker = AudioPipelineWorker()
+        self.audioUnitRuntime = audioUnitRuntime
+        self.recorder = recorder
+        #if DEBUG
+            self.acceptanceAudioBackendOverride =
+                acceptanceAudioBackendOverride
+        #endif
+        pipelineWorker = worker
+        sharedState = SharedAudioState(
+            pipelineWorker: worker,
+            audioUnitRuntime: audioUnitRuntime
+        )
+        worker.setNativePublisher { [weak self] frame in
+            self?.spectrogramImage = frame.image
+            let now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+            let age =
+                now >= frame.column.timestampNanoseconds
+                ? now - frame.column.timestampNanoseconds
+                : 0
+            self?.spectrogramImageAgeMilliseconds =
+                Double(age) / 1_000_000
+        }
+    }
+
+    isolated deinit {
+        uiUpdateTimer?.setEventHandler {}
+        uiUpdateTimer?.cancel()
+        autoGainTimer?.invalidate()
+
+        sharedState.setPlaybackEnabled(false)
+        sharedState.setVolume(0)
+        inputCallbackContext?.deactivateAndWait()
+        outputCallbackContext?.deactivateAndWait()
+
+        if let inputUnit {
+            if inputUnitStarted {
+                _ = audioUnitRuntime.stop(inputUnit)
+            }
+            if audioUnitRuntime.dispose(inputUnit) == noErr {
+                releaseInputCallbackRefCon()
+            } else {
+                // Core Audio may still hold the tiny callback context. Detach
+                // the full pipeline so a teardown failure cannot leak it.
+                inputCallbackContext?.detachState()
+            }
+        }
+        if let outputUnit {
+            if outputUnitStarted {
+                _ = audioUnitRuntime.stop(outputUnit)
+            }
+            if audioUnitRuntime.dispose(outputUnit) == noErr {
+                releaseOutputCallbackRefCon()
+            } else {
+                outputCallbackContext?.detachState()
+            }
+        }
+        pipelineWorker.stopAndDrain()
+    }
+
+    func startMonitoring(
+        deviceID: AudioDeviceID,
+        outputDeviceID: AudioDeviceID?,
+        inputChannelMap: [Int32] = [0, 1]
+    ) {
         stopMonitoring()
-
-        inputDeviceID = deviceID
-        self.outputDeviceID = outputDeviceID ?? deviceID
-
-        guard setupInputUnit(deviceID: deviceID),
-              setupOutputUnit(deviceID: self.outputDeviceID) else {
-            stopMonitoring()
+        guard inputUnit == nil, self.outputUnit == nil else {
+            if lastError == nil {
+                recordFailure(
+                    operation: "Restart audio",
+                    status: kAudio_ParamError,
+                    deviceID: deviceID,
+                    detail: "A previous AudioUnit is still awaiting Core Audio cleanup."
+                )
+            }
             return
         }
 
-        sharedState.sameDevice = (inputDeviceID == self.outputDeviceID)
-        sharedState.setGain(gain)
-        sharedState.setVolume(isPassthroughEnabled ? gain : 0)
-        sharedState.setMeteringEnabled(isMeteringEnabled)
+        engineStatus = .starting
+        lastError = nil
+        hasActiveOutputFailure = false
+        inputDeviceID = deviceID
+        self.outputDeviceID = outputDeviceID
+        self.inputChannelMap = Self.normalizedChannelMap(inputChannelMap)
 
-        AudioOutputUnitStart(inputUnit!)
-        if isPassthroughEnabled {
-            AudioOutputUnitStart(outputUnit!)
+        #if DEBUG
+            if shouldUseAcceptanceAudioBackend {
+                startFakeMonitoring()
+                return
+            }
+        #endif
+
+        guard
+            setupInputUnit(
+                deviceID: deviceID,
+                channelMap: self.inputChannelMap
+            )
+        else {
+            return
         }
 
+        sharedState.sameDevice = outputDeviceID == deviceID
+        sharedState.setGain(gain)
+        // Input gain is applied exactly once in the capture callback. Local
+        // monitor output remains unity unless monitoring is disabled.
+        sharedState.setVolume(1)
+        sharedState.setMeteringEnabled(isMeteringEnabled)
+        pipelineWorker.configure(sampleRate: captureSampleRate)
+
+        guard let inputUnit else {
+            recordFailure(
+                operation: "Start input",
+                status: kAudio_ParamError,
+                deviceID: deviceID,
+                detail: "The input AudioUnit was not created."
+            )
+            disposeAudioUnits()
+            return
+        }
+        // Treat a failed start conservatively: Core Audio may have partially
+        // activated the unit, so teardown must still issue a stop.
+        inputUnitStarted = true
+        let startStatus = audioUnitRuntime.start(inputUnit)
+        guard
+            requireNoErr(
+                startStatus,
+                operation: "Start input",
+                deviceID: deviceID
+            )
+        else {
+            disposeAudioUnits()
+            return
+        }
         isMonitoring = true
+        engineStatus = .running(
+            AudioRuntimeFormat(
+                sampleRate: captureSampleRate,
+                channelCount: 2,
+                bufferFrames: negotiatedBufferFrames,
+                inputChannelMap: self.inputChannelMap
+            )
+        )
 
         // Always start UI update timer for visualizations and metering
         startUIUpdateTimer()
@@ -150,59 +353,201 @@ class AudioMonitor {
     func stopMonitoring() {
         stopUIUpdateTimer()
         isPassthroughEnabled = false
+        sharedState.setPlaybackEnabled(false)
         stopStreaming()
+        #if DEBUG
+            fakeCaptureSource?.stop()
+            fakeCaptureSource = nil
+        #endif
+
+        _ = disposeInputUnit()
+
+        // Capture is stopped before the worker is drained, guaranteeing that
+        // a recording can be finalized without a producer racing its boundary.
         stopRecording()
+        pipelineWorker.stopAndDrain()
 
-        if let unit = inputUnit {
-            AudioOutputUnitStop(unit)
-            AudioComponentInstanceDispose(unit)
-            inputUnit = nil
-        }
-
-        if let unit = outputUnit {
-            AudioOutputUnitStop(unit)
-            AudioComponentInstanceDispose(unit)
-            outputUnit = nil
-        }
+        _ = disposeOutputUnit()
 
         isMonitoring = false
         peakLevel = 0
-        sharedState.reset()
+        if inputUnit == nil, outputUnit == nil {
+            sharedState.reset()
+        }
+        if case .failed = engineStatus {
+            // Preserve the actionable failure after teardown.
+        } else {
+            engineStatus = .idle
+        }
     }
+
+    #if DEBUG
+        private func startFakeMonitoring() {
+            captureSampleRate = 48_000
+            negotiatedBufferFrames = 256
+            sharedState.sameDevice = true
+            sharedState.setGain(gain)
+            sharedState.setVolume(1)
+            sharedState.setMeteringEnabled(isMeteringEnabled)
+            pipelineWorker.configure(sampleRate: captureSampleRate)
+
+            let source = FakeCaptureSource(
+                sharedState: sharedState,
+                sampleRate: captureSampleRate,
+                frameCount: Int(negotiatedBufferFrames)
+            )
+            fakeCaptureSource = source
+            source.start()
+
+            isMonitoring = true
+            engineStatus = .running(
+                AudioRuntimeFormat(
+                    sampleRate: captureSampleRate,
+                    channelCount: 2,
+                    bufferFrames: negotiatedBufferFrames,
+                    inputChannelMap: inputChannelMap
+                )
+            )
+            startUIUpdateTimer()
+        }
+    #endif
 
     // MARK: - Passthrough
 
     func enablePassthrough() {
-        guard outputUnit != nil else { return }
+        guard isMonitoring, let outputDeviceID else {
+            recordOutputFailure(
+                operation: "Enable monitor",
+                status: kAudio_ParamError,
+                deviceID: outputDeviceID,
+                detail: "Select an output device before enabling monitoring."
+            )
+            return
+        }
+        #if DEBUG
+            if shouldUseAcceptanceAudioBackend {
+                sharedState.resetPlayback()
+                // The acceptance backend has no output callback consumer.
+                sharedState.setPlaybackEnabled(false)
+                sharedState.setVolume(1)
+                isPassthroughEnabled = true
+                recoverFromOutputFailureIfNeeded()
+                return
+            }
+        #endif
+        if outputUnit != nil, !outputUnitInitialized {
+            guard disposeOutputUnit() else { return }
+        }
+        if outputUnit == nil, !setupOutputUnit(deviceID: outputDeviceID) {
+            return
+        }
+        guard let outputUnit else { return }
+        outputCallbackContext?.deactivateAndWait()
+        sharedState.resetPlayback()
+        sharedState.setPlaybackEnabled(true)
+        sharedState.setVolume(1)
+        outputCallbackContext?.activate()
+        if outputUnitStarted {
+            // A previous stop returned an error, so conservatively treat the
+            // unit as still running instead of starting it a second time.
+            isPassthroughEnabled = true
+            recoverFromOutputFailureIfNeeded()
+            return
+        }
+        outputUnitStarted = true
+        let status = audioUnitRuntime.start(outputUnit)
+        guard
+            requireOutputNoErr(
+                status,
+                operation: "Start output",
+                deviceID: outputDeviceID
+            )
+        else {
+            sharedState.setPlaybackEnabled(false)
+            sharedState.setVolume(0)
+            outputCallbackContext?.deactivateAndWait()
+            _ = disposeOutputUnit()
+            if self.outputUnit == nil {
+                sharedState.resetPlayback()
+            }
+            return
+        }
         isPassthroughEnabled = true
-        sharedState.setVolume(gain)
-        sharedState.setGain(gain)
-        AudioOutputUnitStart(outputUnit!)
+        recoverFromOutputFailureIfNeeded()
     }
 
     func disablePassthrough() {
-        guard outputUnit != nil else { return }
+        #if DEBUG
+            if shouldUseAcceptanceAudioBackend {
+                isPassthroughEnabled = false
+                sharedState.setPlaybackEnabled(false)
+                sharedState.setVolume(0)
+                sharedState.resetPlayback()
+                return
+            }
+        #endif
+        guard let outputUnit else {
+            sharedState.setPlaybackEnabled(false)
+            sharedState.setVolume(0)
+            sharedState.resetPlayback()
+            return
+        }
         isPassthroughEnabled = false
+        sharedState.setPlaybackEnabled(false)
         sharedState.setVolume(0)
-        AudioOutputUnitStop(outputUnit!)
+        outputCallbackContext?.deactivateAndWait()
+        guard outputUnitStarted else {
+            sharedState.resetPlayback()
+            return
+        }
+        let status = audioUnitRuntime.stop(outputUnit)
+        guard status == noErr else {
+            // Keep ownership and the conservative "started" state. The gate
+            // makes any callback that Core Audio continues to issue return
+            // silence without touching the playback ring.
+            recordOutputFailure(
+                operation: "Stop output",
+                status: status,
+                deviceID: outputDeviceID,
+                detail: "Core Audio could not stop output monitoring."
+            )
+            return
+        }
+        outputUnitStarted = false
+        sharedState.resetPlayback()
     }
 
     func updatePassthroughOutput(deviceID: AudioDeviceID) {
-        guard isMonitoring else { return }
+        let shouldRestart = isMonitoring && isPassthroughEnabled
+        let previousDeviceID = outputDeviceID
+
+        if outputUnit != nil {
+            isPassthroughEnabled = false
+            sharedState.setPlaybackEnabled(false)
+            sharedState.setVolume(0)
+            guard disposeOutputUnit() else {
+                outputDeviceID = previousDeviceID
+                return
+            }
+            sharedState.resetPlayback()
+        }
+
         outputDeviceID = deviceID
+        guard shouldRestart else { return }
+        enablePassthrough()
+    }
 
-        if let unit = outputUnit {
-            AudioOutputUnitStop(unit)
-            AudioComponentInstanceDispose(unit)
+    func clearPassthroughOutput() {
+        disablePassthrough()
+        if outputUnit != nil {
+            guard disposeOutputUnit() else { return }
+            sharedState.resetPlayback()
         }
-
-        if setupOutputUnit(deviceID: deviceID), isPassthroughEnabled {
-            AudioOutputUnitStart(outputUnit!)
-        }
+        outputDeviceID = nil
     }
 
     func updatePassthroughVolume() {
-        sharedState.setVolume(isPassthroughEnabled ? gain : 0)
+        sharedState.setVolume(isPassthroughEnabled ? 1 : 0)
         sharedState.setGain(gain)
     }
 
@@ -210,23 +555,134 @@ class AudioMonitor {
 
     func startStreaming(port: UInt16 = 7865, allowedHosts: [String] = []) {
         guard !isStreamingEnabled else { return }
-        do {
-            streamServer.allowedHosts = allowedHosts
-            try streamServer.start(port: port, sampleRate: captureSampleRate)
-            isStreamingEnabled = true
-            let ip = AudioStreamServer.localIPAddress() ?? "localhost"
-            streamURL = "http://\(ip):\(port)"
-        } catch {
-            isStreamingEnabled = false
-            streamURL = ""
-        }
+        _ = allowedHosts  // Source policy is enforced by LegacyStreamServer.
+        pipelineWorker.setLegacyStreamingEnabled(true)
+        isStreamingEnabled = true
+        updateStreamURL(fallbackPort: port)
     }
 
     func stopStreaming() {
-        streamServer.stop()
+        pipelineWorker.setLegacyStreamingEnabled(false)
         isStreamingEnabled = false
         streamURL = ""
     }
+
+    /// Connects the capture worker to the paired-LAN server. The fanout is
+    /// injected separately because the server and monitor intentionally share
+    /// one bounded source of browser and legacy audio chunks.
+    func attachRemoteAccess(
+        audioFanout: RemoteAudioFanout,
+        server: RemoteAccessServer,
+        baseURL: String? = nil
+    ) {
+        pipelineAudioFanout = audioFanout
+        pipelineRemoteServer = server
+        pairedRemoteBaseURL = baseURL
+        refreshRemotePipelineAttachment()
+        // Default to ready-to-listen until the coordinator starts publishing
+        // exact subscription visibility; this prevents the first browser
+        // connection from waiting for a later state reconciliation.
+        remoteAudioSubscribersVisible = true
+        pipelineWorker.setRemoteAudioSubscribersVisible(true)
+    }
+
+    func detachRemoteAccess() {
+        remoteSpectrumSubscribersVisible = false
+        remoteAudioSubscribersVisible = false
+        pairedRemoteBaseURL = nil
+        pipelineRemoteServer = nil
+        pipelineWorker.setRemoteSpectrumSubscribersVisible(false)
+        pipelineWorker.setRemoteAudioSubscribersVisible(false)
+        refreshRemotePipelineAttachment()
+        if isStreamingEnabled {
+            updateStreamURL()
+        }
+    }
+
+    /// Connects the dedicated compatibility listener to the same bounded
+    /// fanout used by paired browser audio. No WebUI or API service is implied.
+    func attachLegacyStream(
+        audioFanout: RemoteAudioFanout,
+        baseURL: String
+    ) {
+        pipelineAudioFanout = audioFanout
+        legacyListenerBaseURL = baseURL
+        refreshRemotePipelineAttachment()
+        if isStreamingEnabled {
+            updateStreamURL()
+        }
+    }
+
+    /// Detaches only the dedicated listener. A concurrently running paired
+    /// server keeps its browser audio and authenticated `/stream` route.
+    func detachLegacyStream() {
+        legacyListenerBaseURL = nil
+        refreshRemotePipelineAttachment()
+        if isStreamingEnabled {
+            updateStreamURL()
+        }
+    }
+
+    private func refreshRemotePipelineAttachment() {
+        let shouldKeepAudioFanout =
+            pipelineRemoteServer != nil || legacyListenerBaseURL != nil
+        if !shouldKeepAudioFanout {
+            pipelineAudioFanout = nil
+        }
+        pipelineWorker.attach(
+            remoteAudio: shouldKeepAudioFanout ? pipelineAudioFanout : nil,
+            remoteServer: pipelineRemoteServer
+        )
+    }
+
+    private func updateStreamURL(fallbackPort: UInt16 = 7865) {
+        let localHost =
+            RemoteLocalInterfaces.currentAddresses().sorted().first
+            ?? "localhost"
+        let localAuthority =
+            localHost.contains(":") ? "[\(localHost)]" : localHost
+        let baseURL =
+            legacyListenerBaseURL
+            ?? pairedRemoteBaseURL
+            ?? "http://\(localAuthority):\(fallbackPort)"
+        streamURL =
+            "\(baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/")))/stream"
+    }
+
+    /// AppCoordinator updates this from the authoritative remote visibility
+    /// state. Analysis remains fully suspended when both this and the native
+    /// advanced visualization are false.
+    func setRemoteSpectrumSubscribersVisible(_ visible: Bool) {
+        remoteSpectrumSubscribersVisible = visible
+        pipelineWorker.setRemoteSpectrumSubscribersVisible(visible)
+    }
+
+    func setRemoteAudioSubscribersVisible(_ visible: Bool) {
+        remoteAudioSubscribersVisible = visible
+        pipelineWorker.setRemoteAudioSubscribersVisible(visible)
+    }
+
+    #if DEBUG
+        var testingCallbackGain: Float {
+            sharedState.getParams().gain
+        }
+
+        var testingAutoGainPeak: Float {
+            sharedState.getAutoGainPeakLevel()
+        }
+
+        var testingEQIsActive: Bool {
+            sharedState.isEQActive
+        }
+
+        var testingAutoGainTimerIdentity: ObjectIdentifier? {
+            autoGainTimer.map(ObjectIdentifier.init)
+        }
+
+        func testingAdjustAutoGain() {
+            adjustAutoGain()
+        }
+    #endif
 
     // MARK: - Recording
 
@@ -235,29 +691,64 @@ class AudioMonitor {
         do {
             let url = try recorder.start(sampleRate: captureSampleRate)
             recordingURL = url
+            lastRecordingFailure = nil
             isRecording = true
             recordingDuration = 0
-            sharedState.recorderPtr = Unmanaged.passUnretained(recorder).toOpaque()
+            pipelineWorker.setRecorder(recorder)
             os_log(.info, "PhonoFlow: Recording started → %{public}@", url.path)
         } catch {
             isRecording = false
             recordingURL = nil
+            if case .initializationFailed(let failure) =
+                error as? AudioRecorder.RecorderError
+            {
+                lastRecordingFailure = failure
+            } else {
+                lastRecordingFailure = nil
+            }
             os_log(.error, "PhonoFlow: Recording failed — %{public}@", error.localizedDescription)
         }
     }
 
-    func stopRecording() {
-        guard isRecording else { return }
-        sharedState.recorderPtr = nil
-        let url = recorder.stop()
+    @discardableResult
+    func stopRecording() -> AudioRecorder.TerminalResult? {
+        guard isRecording else { return nil }
+        pipelineWorker.setRecorder(nil)
+        let result = recorder.stop()
         isRecording = false
-        recordingURL = url
+        switch result {
+        case .success(let recording):
+            recordingURL = recording.url
+            lastRecordingFailure = nil
+        case .failure(let failure):
+            recordingURL = nil
+            lastRecordingFailure = failure
+            os_log(
+                .error,
+                "PhonoFlow: Recording finalization failed — %{public}@",
+                failure.localizedDescription
+            )
+        case nil:
+            recordingURL = nil
+        }
+        return result
     }
 
     // MARK: - Audio Unit Setup
 
-    private func setupInputUnit(deviceID: AudioDeviceID) -> Bool {
-        var desc = AudioComponentDescription(
+    static func normalizedChannelMap(_ map: [Int32]) -> [Int32] {
+        switch map.count {
+        case 0: return [0, 0]
+        case 1: return [max(map[0], 0), max(map[0], 0)]
+        default: return [max(map[0], 0), max(map[1], 0)]
+        }
+    }
+
+    private func setupInputUnit(
+        deviceID: AudioDeviceID,
+        channelMap: [Int32]
+    ) -> Bool {
+        let desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput,
             componentManufacturer: kAudioUnitManufacturer_Apple,
@@ -265,67 +756,218 @@ class AudioMonitor {
             componentFlagsMask: 0
         )
 
-        guard let component = AudioComponentFindNext(nil, &desc) else { return false }
+        guard let component = audioUnitRuntime.findComponent(matching: desc) else {
+            recordFailure(
+                operation: "Find AUHAL input component",
+                status: kAudio_ParamError,
+                deviceID: deviceID,
+                detail: "Core Audio did not provide a HAL output component."
+            )
+            return false
+        }
 
         var unit: AudioUnit?
-        guard AudioComponentInstanceNew(component, &unit) == noErr,
-              let unit = unit else { return false }
+        let createStatus = audioUnitRuntime.instantiate(component, unit: &unit)
+        guard
+            requireNoErr(
+                createStatus,
+                operation: "Create input AudioUnit",
+                deviceID: deviceID
+            ), let unit
+        else {
+            return false
+        }
+        inputUnit = unit
+
+        func fail(
+            _ status: OSStatus,
+            operation: String,
+            detail: String = ""
+        ) -> Bool {
+            recordFailure(
+                operation: operation,
+                status: status,
+                deviceID: deviceID,
+                detail: detail.isEmpty ? "Core Audio rejected the input configuration." : detail
+            )
+            _ = disposeInputUnit()
+            return false
+        }
 
         var enableIO: UInt32 = 1
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
-                           kAudioUnitScope_Input, 1, &enableIO, UInt32(MemoryLayout<UInt32>.size))
+        var status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioOutputUnitProperty_EnableIO,
+            scope: kAudioUnitScope_Input,
+            element: 1,
+            data: &enableIO,
+            byteCount: UInt32(MemoryLayout<UInt32>.size)
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Enable input I/O")
+        }
+
         enableIO = 0
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_EnableIO,
-                           kAudioUnitScope_Output, 0, &enableIO, UInt32(MemoryLayout<UInt32>.size))
+        status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioOutputUnitProperty_EnableIO,
+            scope: kAudioUnitScope_Output,
+            element: 0,
+            data: &enableIO,
+            byteCount: UInt32(MemoryLayout<UInt32>.size)
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Disable input-unit output I/O")
+        }
 
         var deviceIDVar = deviceID
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                           kAudioUnitScope_Global, 0, &deviceIDVar, UInt32(MemoryLayout<AudioDeviceID>.size))
+        status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioOutputUnitProperty_CurrentDevice,
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            data: &deviceIDVar,
+            byteCount: UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Select input device")
+        }
 
-        setDeviceBufferSize(deviceID)
+        switch negotiateDeviceBufferSize(deviceID) {
+        case .success(let bufferFrames):
+            negotiatedBufferFrames = bufferFrames
+        case .failure(let failure):
+            return fail(
+                failure.status,
+                operation: failure.operation,
+                detail: failure.detail
+            )
+        }
 
-        var asbd = AudioStreamBasicDescription()
+        var deviceFormat = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                           kAudioUnitScope_Input, 1, &asbd, &size)
+        status = audioUnitRuntime.getProperty(
+            unit,
+            id: kAudioUnitProperty_StreamFormat,
+            scope: kAudioUnitScope_Input,
+            element: 1,
+            data: &deviceFormat,
+            byteCount: &size
+        )
+        guard status == noErr, deviceFormat.mSampleRate > 0 else {
+            return fail(
+                status == noErr ? kAudio_ParamError : status,
+                operation: "Read input device format"
+            )
+        }
 
-        captureSampleRate = asbd.mSampleRate
-        let channelCount = asbd.mChannelsPerFrame
+        let hardwareChannelCount = Int(deviceFormat.mChannelsPerFrame)
+        guard
+            channelMap.allSatisfy({
+                $0 >= 0 && Int($0) < hardwareChannelCount
+            })
+        else {
+            return fail(
+                kAudio_ParamError,
+                operation: "Select input channels",
+                detail: "The selected channel pair is unavailable on this \(hardwareChannelCount)-channel device."
+            )
+        }
 
-        asbd.mFormatID = kAudioFormatLinearPCM
-        asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved
-        asbd.mBitsPerChannel = 32
-        asbd.mBytesPerFrame = 4
-        asbd.mBytesPerPacket = 4
-        asbd.mFramesPerPacket = 1
-        asbd.mChannelsPerFrame = channelCount
+        captureSampleRate = deviceFormat.mSampleRate
+        var clientFormat = AudioStreamBasicDescription(
+            mSampleRate: captureSampleRate,
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsFloat
+                | kAudioFormatFlagIsPacked
+                | kAudioFormatFlagIsNonInterleaved,
+            mBytesPerPacket: UInt32(MemoryLayout<Float>.size),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(MemoryLayout<Float>.size),
+            mChannelsPerFrame: 2,
+            mBitsPerChannel: 32,
+            mReserved: 0
+        )
+        status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioUnitProperty_StreamFormat,
+            scope: kAudioUnitScope_Output,
+            element: 1,
+            data: &clientFormat,
+            byteCount: UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Set two-channel input client format")
+        }
 
-        AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
-                           kAudioUnitScope_Output, 1, &asbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        var map = Self.normalizedChannelMap(channelMap)
+        status = map.withUnsafeMutableBytes { bytes in
+            audioUnitRuntime.setProperty(
+                unit,
+                id: kAudioOutputUnitProperty_ChannelMap,
+                scope: kAudioUnitScope_Output,
+                element: 1,
+                data: bytes.baseAddress,
+                byteCount: UInt32(bytes.count)
+            )
+        }
+        guard status == noErr else {
+            return fail(status, operation: "Apply input channel map")
+        }
 
-        sharedState.channelCount = Int(channelCount)
+        var maximumFrames: UInt32 = max(negotiatedBufferFrames, 1)
+        size = UInt32(MemoryLayout<UInt32>.size)
+        status = audioUnitRuntime.getProperty(
+            unit,
+            id: kAudioUnitProperty_MaximumFramesPerSlice,
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            data: &maximumFrames,
+            byteCount: &size
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Read input maximum frames")
+        }
+        sharedState.prepareInputCapacity(Int(maximumFrames) + 1)
+        sharedState.channelCount = 2
         sharedState.updateDCFilterCoefficient(sampleRate: Float(captureSampleRate))
         sharedState.updateEQCoefficients(bands: lastEqBands, sampleRate: Float(captureSampleRate))
 
-        let state = Unmanaged.passUnretained(sharedState).toOpaque()
+        let callbackContext = AudioCallbackContext(state: sharedState)
+        callbackContext.activate()
+        let state = Unmanaged.passRetained(callbackContext).toOpaque()
 
         var callbackStruct = AURenderCallbackStruct(
             inputProc: inputRenderCallback,
             inputProcRefCon: UnsafeMutableRawPointer(mutating: state)
         )
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_SetInputCallback,
-                           kAudioUnitScope_Global, 0, &callbackStruct, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+        status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioOutputUnitProperty_SetInputCallback,
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            data: &callbackStruct,
+            byteCount: UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        )
+        guard status == noErr else {
+            callbackContext.deactivateAndWait()
+            Unmanaged<AudioCallbackContext>.fromOpaque(state).release()
+            return fail(status, operation: "Install input callback")
+        }
+        inputCallbackContext = callbackContext
+        inputCallbackRefCon = state
 
-        sharedState.streamServerPtr = Unmanaged.passUnretained(streamServer).toOpaque()
         sharedState.inputUnit = unit
 
-        AudioUnitInitialize(unit)
-        inputUnit = unit
+        status = audioUnitRuntime.initialize(unit)
+        guard status == noErr else {
+            return fail(status, operation: "Initialize input AudioUnit")
+        }
         return true
     }
 
     private func setupOutputUnit(deviceID: AudioDeviceID) -> Bool {
-        var desc = AudioComponentDescription(
+        let desc = AudioComponentDescription(
             componentType: kAudioUnitType_Output,
             componentSubType: kAudioUnitSubType_HALOutput,
             componentManufacturer: kAudioUnitManufacturer_Apple,
@@ -333,26 +975,85 @@ class AudioMonitor {
             componentFlagsMask: 0
         )
 
-        guard let component = AudioComponentFindNext(nil, &desc) else { return false }
+        guard let component = audioUnitRuntime.findComponent(matching: desc) else {
+            recordOutputFailure(
+                operation: "Find AUHAL output component",
+                status: kAudio_ParamError,
+                deviceID: deviceID,
+                detail: "Core Audio did not provide a HAL output component."
+            )
+            return false
+        }
 
         var unit: AudioUnit?
-        guard AudioComponentInstanceNew(component, &unit) == noErr,
-              let unit = unit else { return false }
+        let createStatus = audioUnitRuntime.instantiate(component, unit: &unit)
+        guard
+            requireOutputNoErr(
+                createStatus,
+                operation: "Create output AudioUnit",
+                deviceID: deviceID
+            ), let unit
+        else {
+            return false
+        }
+        outputUnit = unit
+        outputUnitInitialized = false
+
+        func fail(
+            _ status: OSStatus,
+            operation: String,
+            detail: String = "Core Audio rejected the output configuration."
+        ) -> Bool {
+            recordOutputFailure(
+                operation: operation,
+                status: status,
+                deviceID: deviceID,
+                detail: detail
+            )
+            _ = disposeOutputUnit()
+            return false
+        }
 
         var deviceIDVar = deviceID
-        AudioUnitSetProperty(unit, kAudioOutputUnitProperty_CurrentDevice,
-                           kAudioUnitScope_Global, 0, &deviceIDVar, UInt32(MemoryLayout<AudioDeviceID>.size))
+        var status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioOutputUnitProperty_CurrentDevice,
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            data: &deviceIDVar,
+            byteCount: UInt32(MemoryLayout<AudioDeviceID>.size)
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Select output device")
+        }
 
-        // Match output device sample rate to input — eliminates HAL resampling
-        setOutputDeviceSampleRate(deviceID, sampleRate: captureSampleRate)
-        setDeviceBufferSize(deviceID)
+        // Never mutate another device's nominal hardware rate. AUHAL performs
+        // the simple PCM conversion from our capture-rate client format.
+        switch negotiateDeviceBufferSize(deviceID) {
+        case .success:
+            break
+        case .failure(let failure):
+            return fail(
+                failure.status,
+                operation: failure.operation,
+                detail: failure.detail
+            )
+        }
 
         var asbd = AudioStreamBasicDescription()
         var size = UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
-        AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
-                           kAudioUnitScope_Input, 0, &asbd, &size)
+        status = audioUnitRuntime.getProperty(
+            unit,
+            id: kAudioUnitProperty_StreamFormat,
+            scope: kAudioUnitScope_Input,
+            element: 0,
+            data: &asbd,
+            byteCount: &size
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Read output device format")
+        }
 
-        let channelCount = asbd.mChannelsPerFrame
         asbd.mFormatID = kAudioFormatLinearPCM
         asbd.mFormatFlags = kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked | kAudioFormatFlagIsNonInterleaved
         asbd.mSampleRate = captureSampleRate
@@ -360,140 +1061,436 @@ class AudioMonitor {
         asbd.mBytesPerFrame = 4
         asbd.mBytesPerPacket = 4
         asbd.mFramesPerPacket = 1
-        asbd.mChannelsPerFrame = channelCount
+        asbd.mChannelsPerFrame = 2
 
-        AudioUnitSetProperty(unit, kAudioUnitProperty_StreamFormat,
-                           kAudioUnitScope_Input, 0, &asbd, UInt32(MemoryLayout<AudioStreamBasicDescription>.size))
+        status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioUnitProperty_StreamFormat,
+            scope: kAudioUnitScope_Input,
+            element: 0,
+            data: &asbd,
+            byteCount: UInt32(MemoryLayout<AudioStreamBasicDescription>.size)
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Set output client format")
+        }
 
-        let state = Unmanaged.passUnretained(sharedState).toOpaque()
+        var maximumFrames: UInt32 = max(negotiatedBufferFrames, 1)
+        size = UInt32(MemoryLayout<UInt32>.size)
+        status = audioUnitRuntime.getProperty(
+            unit,
+            id: kAudioUnitProperty_MaximumFramesPerSlice,
+            scope: kAudioUnitScope_Global,
+            element: 0,
+            data: &maximumFrames,
+            byteCount: &size
+        )
+        guard status == noErr else {
+            return fail(status, operation: "Read output maximum frames")
+        }
+        sharedState.prepareOutputCapacity(Int(maximumFrames) + 2)
+
+        let callbackContext = AudioCallbackContext(state: sharedState)
+        callbackContext.activate()
+        let state = Unmanaged.passRetained(callbackContext).toOpaque()
         var callbackStruct = AURenderCallbackStruct(
             inputProc: outputRenderCallback,
             inputProcRefCon: UnsafeMutableRawPointer(mutating: state)
         )
-        AudioUnitSetProperty(unit, kAudioUnitProperty_SetRenderCallback,
-                           kAudioUnitScope_Input, 0, &callbackStruct, UInt32(MemoryLayout<AURenderCallbackStruct>.size))
+        status = audioUnitRuntime.setProperty(
+            unit,
+            id: kAudioUnitProperty_SetRenderCallback,
+            scope: kAudioUnitScope_Input,
+            element: 0,
+            data: &callbackStruct,
+            byteCount: UInt32(MemoryLayout<AURenderCallbackStruct>.size)
+        )
+        guard status == noErr else {
+            callbackContext.deactivateAndWait()
+            Unmanaged<AudioCallbackContext>.fromOpaque(state).release()
+            return fail(status, operation: "Install output callback")
+        }
+        outputCallbackContext = callbackContext
+        outputCallbackRefCon = state
 
-        AudioUnitInitialize(unit)
-        outputUnit = unit
+        status = audioUnitRuntime.initialize(unit)
+        guard status == noErr else {
+            return fail(status, operation: "Initialize output AudioUnit")
+        }
+        outputUnitInitialized = true
+        sharedState.sameDevice = inputDeviceID == deviceID
         return true
     }
 
-    private func setOutputDeviceSampleRate(_ deviceID: AudioDeviceID, sampleRate: Double) {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioDevicePropertyNominalSampleRate,
+    private func negotiateDeviceBufferSize(
+        _ deviceID: AudioDeviceID
+    ) -> Result<UInt32, AudioEngineFailure> {
+        var rangeAddress = AudioObjectPropertyAddress(
+            mSelector: kAudioDevicePropertyBufferFrameSizeRange,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var rate = sampleRate
-        AudioObjectSetPropertyData(deviceID, &address, 0, nil,
-                                  UInt32(MemoryLayout<Double>.size), &rate)
-    }
+        var range = AudioValueRange(
+            mMinimum: Double(AudioConfig.targetBufferFrames),
+            mMaximum: Double(AudioConfig.targetBufferFrames)
+        )
+        var rangeSize = UInt32(MemoryLayout<AudioValueRange>.size)
+        var status = audioUnitRuntime.getObjectPropertyData(
+            objectID: deviceID,
+            address: &rangeAddress,
+            qualifierDataSize: 0,
+            qualifierData: nil,
+            dataSize: &rangeSize,
+            data: &range
+        )
+        guard status == noErr else {
+            return .failure(
+                AudioEngineFailure(
+                    operation: "Read device buffer range",
+                    status: status,
+                    deviceID: deviceID,
+                    detail: "Core Audio could not report the supported buffer range."
+                )
+            )
+        }
+        let lower = UInt32(max(range.mMinimum, 1))
+        let upper = UInt32(max(range.mMaximum, Double(lower)))
+        var requested = min(max(AudioConfig.targetBufferFrames, lower), upper)
 
-    private func setDeviceBufferSize(_ deviceID: AudioDeviceID) {
         var address = AudioObjectPropertyAddress(
             mSelector: kAudioDevicePropertyBufferFrameSize,
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        var newSize = AudioConfig.targetBufferFrames
-        AudioObjectSetPropertyData(deviceID, &address, 0, nil,
-                                  UInt32(MemoryLayout<UInt32>.size), &newSize)
+        status = audioUnitRuntime.setObjectPropertyData(
+            objectID: deviceID,
+            address: &address,
+            qualifierDataSize: 0,
+            qualifierData: nil,
+            dataSize: UInt32(MemoryLayout<UInt32>.size),
+            data: &requested
+        )
+        guard status == noErr else {
+            return .failure(
+                AudioEngineFailure(
+                    operation: "Set device buffer size",
+                    status: status,
+                    deviceID: deviceID,
+                    detail: "Core Audio could not apply the negotiated buffer size."
+                )
+            )
+        }
+        var actual = requested
+        var actualSize = UInt32(MemoryLayout<UInt32>.size)
+        status = audioUnitRuntime.getObjectPropertyData(
+            objectID: deviceID,
+            address: &address,
+            qualifierDataSize: 0,
+            qualifierData: nil,
+            dataSize: &actualSize,
+            data: &actual
+        )
+        guard status == noErr else {
+            return .failure(
+                AudioEngineFailure(
+                    operation: "Read device buffer size",
+                    status: status,
+                    deviceID: deviceID,
+                    detail: "Core Audio could not confirm the negotiated buffer size."
+                )
+            )
+        }
+        return .success(actual)
+    }
+
+    private func disposeAudioUnits() {
+        sharedState.setPlaybackEnabled(false)
+        sharedState.setVolume(0)
+        _ = disposeInputUnit()
+        _ = disposeOutputUnit()
+        isMonitoring = false
+        isPassthroughEnabled = false
+    }
+
+    /// Stops and disposes the input unit without relinquishing the handle or
+    /// callback retain until Core Audio confirms disposal. A failed stop is
+    /// deliberately followed by disposal: successful disposal is the stronger
+    /// synchronous callback-lifetime boundary.
+    @discardableResult
+    private func disposeInputUnit() -> Bool {
+        guard let unit = inputUnit else { return true }
+        inputCallbackContext?.deactivateAndWait()
+
+        if inputUnitStarted {
+            let status = audioUnitRuntime.stop(unit)
+            if status == noErr {
+                inputUnitStarted = false
+            } else {
+                reportCleanupFailure(
+                    status,
+                    operation: "Stop input",
+                    deviceID: inputDeviceID
+                )
+            }
+        }
+
+        let disposeStatus = audioUnitRuntime.dispose(unit)
+        guard disposeStatus == noErr else {
+            reportCleanupFailure(
+                disposeStatus,
+                operation: "Dispose input AudioUnit",
+                deviceID: inputDeviceID
+            )
+            return false
+        }
+
+        inputUnitStarted = false
+        inputUnit = nil
+        sharedState.inputUnit = nil
+        releaseInputCallbackRefCon()
+        return true
+    }
+
+    /// Mirrors `disposeInputUnit()` for output. In particular, a failed stop
+    /// never permits playback-ring reset while a render callback may be live.
+    @discardableResult
+    private func disposeOutputUnit() -> Bool {
+        guard let unit = outputUnit else { return true }
+        outputCallbackContext?.deactivateAndWait()
+
+        if outputUnitStarted {
+            let status = audioUnitRuntime.stop(unit)
+            if status == noErr {
+                outputUnitStarted = false
+            } else {
+                reportOutputCleanupFailure(
+                    status,
+                    operation: "Stop output",
+                    deviceID: outputDeviceID
+                )
+            }
+        }
+
+        let disposeStatus = audioUnitRuntime.dispose(unit)
+        guard disposeStatus == noErr else {
+            reportOutputCleanupFailure(
+                disposeStatus,
+                operation: "Dispose output AudioUnit",
+                deviceID: outputDeviceID
+            )
+            return false
+        }
+
+        outputUnitStarted = false
+        outputUnitInitialized = false
+        outputUnit = nil
+        releaseOutputCallbackRefCon()
+        return true
+    }
+
+    private func releaseInputCallbackRefCon() {
+        guard let inputCallbackRefCon else { return }
+        self.inputCallbackRefCon = nil
+        inputCallbackContext = nil
+        Unmanaged<AudioCallbackContext>
+            .fromOpaque(inputCallbackRefCon)
+            .release()
+    }
+
+    private func releaseOutputCallbackRefCon() {
+        guard let outputCallbackRefCon else { return }
+        self.outputCallbackRefCon = nil
+        outputCallbackContext = nil
+        Unmanaged<AudioCallbackContext>
+            .fromOpaque(outputCallbackRefCon)
+            .release()
+    }
+
+    @discardableResult
+    private func requireNoErr(
+        _ status: OSStatus,
+        operation: String,
+        deviceID: AudioDeviceID?
+    ) -> Bool {
+        guard status == noErr else {
+            recordFailure(
+                operation: operation,
+                status: status,
+                deviceID: deviceID,
+                detail: "Core Audio returned an error."
+            )
+            return false
+        }
+        return true
+    }
+
+    @discardableResult
+    private func requireOutputNoErr(
+        _ status: OSStatus,
+        operation: String,
+        deviceID: AudioDeviceID?
+    ) -> Bool {
+        guard status == noErr else {
+            recordOutputFailure(
+                operation: operation,
+                status: status,
+                deviceID: deviceID,
+                detail: "Core Audio returned an error."
+            )
+            return false
+        }
+        return true
+    }
+
+    private func reportCleanupFailure(
+        _ status: OSStatus,
+        operation: String,
+        deviceID: AudioDeviceID?
+    ) {
+        guard status != noErr else { return }
+        recordFailure(
+            operation: operation,
+            status: status,
+            deviceID: deviceID,
+            detail: "Core Audio could not complete audio-unit cleanup."
+        )
+    }
+
+    private func reportOutputCleanupFailure(
+        _ status: OSStatus,
+        operation: String,
+        deviceID: AudioDeviceID?
+    ) {
+        guard status != noErr else { return }
+        recordOutputFailure(
+            operation: operation,
+            status: status,
+            deviceID: deviceID,
+            detail: "Core Audio could not complete audio-unit cleanup."
+        )
+    }
+
+    private func recordOutputFailure(
+        operation: String,
+        status: OSStatus,
+        deviceID: AudioDeviceID?,
+        detail: String
+    ) {
+        recordFailure(
+            operation: operation,
+            status: status,
+            deviceID: deviceID,
+            detail: detail
+        )
+        hasActiveOutputFailure = true
+    }
+
+    private func recoverFromOutputFailureIfNeeded() {
+        guard hasActiveOutputFailure, isMonitoring else { return }
+        hasActiveOutputFailure = false
+        lastError = nil
+        engineStatus = .running(
+            AudioRuntimeFormat(
+                sampleRate: captureSampleRate,
+                channelCount: 2,
+                bufferFrames: negotiatedBufferFrames,
+                inputChannelMap: inputChannelMap
+            )
+        )
+    }
+
+    private func recordFailure(
+        operation: String,
+        status: OSStatus,
+        deviceID: AudioDeviceID?,
+        detail: String
+    ) {
+        hasActiveOutputFailure = false
+        let failure = AudioEngineFailure(
+            operation: operation,
+            status: status,
+            deviceID: deviceID,
+            detail: detail
+        )
+        lastError = failure
+        engineStatus = .failed(failure)
+        os_log(.error, "PhonoFlow audio error: %{public}@", failure.localizedDescription)
     }
 
     // MARK: - UI Updates
 
-    private var displayLink: CVDisplayLink?
+    private var uiUpdateTimer: DispatchSourceTimer?
     private var lastUpdateTime: CFTimeInterval = 0
-    private var lastSpectrogramUpdate: CFTimeInterval = 0
 
     // Pre-allocated viz buffers (avoid alloc/dealloc every frame)
     private let vizBufSize = 1024
-    private let vizLeftBuf: UnsafeMutablePointer<Float> = .allocate(capacity: 1024)
-    private let vizRightBuf: UnsafeMutablePointer<Float> = .allocate(capacity: 1024)
+    private let visualizationBuffers = VisualizationBuffers(capacity: 1024)
 
     func startUIUpdateTimer() {
         stopUIUpdateTimer()
-
-        // CVDisplayLink for macOS (synced to display refresh)
-        var link: CVDisplayLink?
-        CVDisplayLinkCreateWithActiveCGDisplays(&link)
-
-        guard let displayLink = link else { return }
-
-        // Callback function for CVDisplayLink
-        let callback: CVDisplayLinkOutputCallback = { (_, _, _, _, _, userData) -> CVReturn in
-            guard let userData = userData else { return kCVReturnSuccess }
-            let monitor = Unmanaged<AudioMonitor>.fromOpaque(userData).takeUnretainedValue()
-
-            // Perform update on main thread
-            DispatchQueue.main.async {
-                monitor.performUIUpdate()
-            }
-
-            return kCVReturnSuccess
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(
+            deadline: .now(),
+            repeating: .milliseconds(33),
+            leeway: .milliseconds(2)
+        )
+        timer.setEventHandler { [weak self] in
+            self?.performUIUpdate()
         }
-
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        CVDisplayLinkSetOutputCallback(displayLink, callback, selfPtr)
-        CVDisplayLinkStart(displayLink)
-
-        self.displayLink = displayLink
+        timer.resume()
+        uiUpdateTimer = timer
     }
 
     private func performUIUpdate() {
         let now = CACurrentMediaTime()
-
-        // Throttle expensive operations
         let timeSinceLastUpdate = now - lastUpdateTime
-        let timeSinceSpectrogram = now - lastSpectrogramUpdate
-
-        // Skip if updating too fast (throttle to ~60fps max)
-        guard timeSinceLastUpdate >= (1.0 / 60.0) else { return }
+        guard timeSinceLastUpdate >= (1.0 / 31.0) else { return }
         lastUpdateTime = now
+
+        let renderFailure = sharedState.takeRenderFailure()
+        if renderFailure != noErr {
+            recordFailure(
+                operation: "Render input",
+                status: renderFailure,
+                deviceID: inputDeviceID,
+                detail: "Core Audio could not render the selected input channels."
+            )
+        }
 
         if isMeteringEnabled {
             peakLevel = sharedState.getPeakLevel()
         }
+        callbackOverflowCount = sharedState.callbackOverflows
+        playbackOverflowCount = sharedState.playbackOverflows
+        playbackUnderrunCount = sharedState.playbackUnderruns
+        callbackCount = sharedState.callbackCount
+        maximumCallbackDurationMicroseconds =
+            Double(sharedState.maximumCallbackDurationNanoseconds) / 1_000
+        analysisDroppedFrameCount = pipelineWorker.analysisDroppedFrames
+        fanoutDroppedFrameCount = pipelineWorker.fanoutDroppedFrames
+        analysisQueueDepth = pipelineWorker.analysisQueueDepth
+        fanoutQueueDepth = pipelineWorker.fanoutQueueDepth
+        spectrogramRenderSkipCount = pipelineWorker.skippedNativeFrames
 
         // Update recording duration
         if isRecording {
             recordingDuration = recorder.durationSeconds
+            if !recorder.isRecording {
+                stopRecording()
+            }
         }
 
-        // Skip expensive viz work when app is collapsed
         if !visualizationsPaused {
-            // Update spectrogram at 15fps — reduces FFT/render workload by ~25% vs 20fps
-            // while maintaining smooth visual updates. 67ms cadence gives audio thread
-            // more headroom for recording and processing.
-            let shouldUpdateSpectrogram = spectrogramEnabled && (timeSinceSpectrogram >= (1.0 / 15.0))
-
-            if shouldUpdateSpectrogram {
-                lastSpectrogramUpdate = now
-                updateVisualizationData()
-            } else {
-                // Update waveforms and phase scope (lightweight)
-                updateVisualizationDataLightweight()
-            }
+            updateVisualizationDataLightweight()
         } else {
-            // Still update L/R levels for the meter bars (cheap)
             updateLevelsOnly()
         }
     }
 
-    // FFT setup (reused across calls)
-    private var fftSetup: FFTSetup?
-    private let fftLog2N: vDSP_Length = 9  // 2^9 = 512 samples (down from 1024 for ~2x speed)
-    private let fftSize = 512  // Reduced from 1024 for faster computation
-
-    // Spectrogram image rendering constants (optimized for CPU efficiency)
-    private let spectrogramLogRows = 64  // Reduced from 80 for better performance (30% faster)
-    private let spectrogramMinFreq: Double = 20
-    private let spectrogramMaxFreq: Double = 20000
-
     /// Lightweight update — waveforms and phase at refresh rate, no spectrogram
     private func updateVisualizationDataLightweight() {
-        let leftBuf = vizLeftBuf
-        let rightBuf = vizRightBuf
+        let leftBuf = visualizationBuffers.left
+        let rightBuf = visualizationBuffers.right
 
         let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: vizBufSize)
         guard count > 0 else { return }
@@ -510,12 +1507,13 @@ class AudioMonitor {
         }
 
         // Update L/R levels with smoothing
-        var leftRms: Float = 0, rightRms: Float = 0
+        var leftRms: Float = 0
+        var rightRms: Float = 0
         vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
         vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
 
-        let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
-        let scaledRight = min(rightRms * 4.0 * gain, 1.0)
+        let scaledLeft = min(leftRms * 4.0, 1.0)
+        let scaledRight = min(rightRms * 4.0, 1.0)
 
         let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
         let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
@@ -525,18 +1523,19 @@ class AudioMonitor {
 
     /// Lightweight update — only L/R levels for meter bars when viz is paused
     private func updateLevelsOnly() {
-        let leftBuf = vizLeftBuf
-        let rightBuf = vizRightBuf
+        let leftBuf = visualizationBuffers.left
+        let rightBuf = visualizationBuffers.right
 
         let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: vizBufSize)
         guard count > 0 else { return }
 
-        var leftRms: Float = 0, rightRms: Float = 0
+        var leftRms: Float = 0
+        var rightRms: Float = 0
         vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
         vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
 
-        let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
-        let scaledRight = min(rightRms * 4.0 * gain, 1.0)
+        let scaledLeft = min(leftRms * 4.0, 1.0)
+        let scaledRight = min(rightRms * 4.0, 1.0)
 
         let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
         let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
@@ -546,13 +1545,8 @@ class AudioMonitor {
 
     /// Clear spectrogram history and resume fresh
     func clearSpectrogram() {
-        if let buf = spectrogramBuffer {
-            let total = spectrogramMaxFrames * spectrogramBinsPerFrame
-            buf.update(repeating: 0, count: total)
-        }
-        spectrogramWriteIdx = 0
-        spectrogramCount = 0
         spectrogramImage = nil
+        pipelineWorker.clearNativeHistory()
     }
 
     func enableSpectrogram() {
@@ -575,372 +1569,34 @@ class AudioMonitor {
         enableSpectrogram()
     }
 
-    private func updateVisualizationData() {
-        let leftBuf = vizLeftBuf
-        let rightBuf = vizRightBuf
-
-        let count = sharedState.peekStereoRecent(left: leftBuf, right: rightBuf, count: vizBufSize)
-        guard count > 0 else { return }
-
-        // Update waveform data
-        let waveformCount = min(200, count)
-        leftWaveform = Array(UnsafeBufferPointer(start: leftBuf, count: waveformCount))
-        rightWaveform = Array(UnsafeBufferPointer(start: rightBuf, count: waveformCount))
-
-        // Update phase scope points (downsample to 60 points)
-        let step = max(waveformCount / 60, 1)
-        phasePoints = stride(from: 0, to: waveformCount, by: step).map { i in
-            (x: leftBuf[i], y: rightBuf[i])
-        }
-
-        // Update L/R levels with smoothing
-        var leftRms: Float = 0, rightRms: Float = 0
-        vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(count))
-        vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(count))
-
-        let scaledLeft = min(leftRms * 4.0 * gain, 1.0)
-        let scaledRight = min(rightRms * 4.0 * gain, 1.0)
-
-        let attackL: Float = scaledLeft > leftLevel ? 0.85 : 0.25
-        let attackR: Float = scaledRight > rightLevel ? 0.85 : 0.25
-        leftLevel += attackL * (scaledLeft - leftLevel)
-        rightLevel += attackR * (scaledRight - rightLevel)
-
-        // FFT → spectrogram (only if enabled, lightweight computation)
-        if spectrogramEnabled && count >= fftSize {
-            ensureSpectrogramBuffersAllocated()
-            if fftSetup == nil {
-                fftSetup = vDSP_create_fftsetup(fftLog2N, FFTRadix(kFFTRadix2))
-            }
-
-            guard let setup = fftSetup,
-                  let ringBuf = spectrogramBuffer,
-                  let snapshotBuf = spectrogramSnapshot,
-                  let magBuf = fftMagBuf else { return }
-
-            let bins = spectrogramBinsPerFrame
-            let writeRow = ringBuf.advanced(by: spectrogramWriteIdx * bins)
-
-            // Compute FFT magnitude directly into the ring buffer slot.
-            computeFFTSpectrum(samples: leftBuf, count: fftSize, setup: setup, output: writeRow)
-
-            // Temporal smoothing: velocity-based blend (75% new, 25% decay from prev)
-            // Single vDSP multiply+add is faster than separate mul→add calls
-            if spectrogramCount > 0 {
-                let prevIdx = (spectrogramWriteIdx - 1 + spectrogramMaxFrames) % spectrogramMaxFrames
-                let prevRow = ringBuf.advanced(by: prevIdx * bins)
-                let newRow = writeRow
-                // In-place: new_row = 0.75 * new_row + 0.25 * prev_row
-                for i in 0..<bins {
-                    newRow[i] = 0.75 * newRow[i] + 0.25 * prevRow[i]
-                }
-            }
-
-            spectrogramWriteIdx = (spectrogramWriteIdx + 1) % spectrogramMaxFrames
-            spectrogramCount = min(spectrogramCount + 1, spectrogramMaxFrames)
-
-            // Offload rendering to background thread (non-blocking).
-            // Skip if previous render still in progress (graceful backpressure).
-            if !isRenderingSpectrogram {
-                isRenderingSpectrogram = true
-
-                // Snapshot the ring into a separate buffer so the audio path
-                // can keep writing while rendering proceeds. memcpy is far
-                // cheaper than copying [[Float]] (~180KB of pointer-heavy data).
-                let totalFloats = spectrogramMaxFrames * bins
-                memcpy(snapshotBuf, ringBuf, totalFloats * MemoryLayout<Float>.stride)
-
-                let writeIdx = spectrogramWriteIdx
-                let frameCount = spectrogramCount
-                let sampleRate = captureSampleRate
-
-                spectrogramQueue.async { [weak self] in
-                    guard let self = self else { return }
-                    let image = self.renderSpectrogramImageOffline(
-                        snapshot: snapshotBuf,
-                        bins: bins,
-                        writeIdx: writeIdx,
-                        count: frameCount,
-                        sampleRate: sampleRate
-                    )
-                    DispatchQueue.main.async {
-                        self.spectrogramImage = image
-                        self.isRenderingSpectrogram = false
-                    }
-                }
-            }
-        }
-    }
-
-    private func ensureSpectrogramBuffersAllocated() {
-        let bins = spectrogramBinsPerFrame
-        if spectrogramBuffer == nil {
-            let total = spectrogramMaxFrames * bins
-            let buf = UnsafeMutablePointer<Float>.allocate(capacity: total)
-            buf.initialize(repeating: 0, count: total)
-            spectrogramBuffer = buf
-
-            let snap = UnsafeMutablePointer<Float>.allocate(capacity: total)
-            snap.initialize(repeating: 0, count: total)
-            spectrogramSnapshot = snap
-        }
-        if fftRealBuf == nil {
-            fftRealBuf = .allocate(capacity: bins)
-            fftRealBuf?.initialize(repeating: 0, count: bins)
-            fftImagBuf = .allocate(capacity: bins)
-            fftImagBuf?.initialize(repeating: 0, count: bins)
-            fftMagBuf = .allocate(capacity: bins)
-            fftMagBuf?.initialize(repeating: 0, count: bins)
-        }
-        if spectrogramPixels == nil {
-            let pxCount = spectrogramMaxFrames * spectrogramLogRows * 4
-            spectrogramPixels = .allocate(capacity: pxCount)
-            spectrogramPixels?.initialize(repeating: 0, count: pxCount)
-        }
-    }
-
-    // Pre-computed lookup table for fast color mapping (256 entries) - static to avoid Observable macro conflict
-    private static let colorLUT: [(UInt8, UInt8, UInt8)] = {
-        return (0..<256).map { i in
-            let magnitude = Float(i) / 255.0
-            return AudioMonitor.spectrogramRGBStatic(magnitude: magnitude)
-        }
-    }()
-
-    // Per-row bin index/fraction lookup. Computed once for the active sample rate
-    // for smooth frequency mapping with linear interpolation.
-    private var renderRowBinIdx: [Int] = []
-    private var renderRowBinFrac: [Float] = []
-    private var renderCachedSampleRate: Double = 0
-
-    private func ensureRenderRowTablesUpToDate(sampleRate: Double) {
-        if renderCachedSampleRate == sampleRate, renderRowBinIdx.count == spectrogramLogRows {
-            return
-        }
-        let height = spectrogramLogRows
-        let nyquist = sampleRate / 2.0
-        let logMin = log(spectrogramMinFreq)
-        let logMax = log(spectrogramMaxFreq)
-        let logRange = logMax - logMin
-        let totalBins = spectrogramBinsPerFrame
-
-        var idxs = [Int](repeating: 0, count: height)
-        var fracs = [Float](repeating: 0, count: height)
-        for row in 0..<height {
-            let logFreq = logMin + logRange * Double(row) / Double(height)
-            let freq = exp(logFreq)
-            let bin = freq / nyquist * Double(totalBins)
-            let binIdx = Int(bin)
-            idxs[row] = binIdx
-            fracs[row] = Float(bin - Double(binIdx))
-        }
-        renderRowBinIdx = idxs
-        renderRowBinFrac = fracs
-        renderCachedSampleRate = sampleRate
-    }
-
-    /// Thread-safe offline rendering using the pre-allocated snapshot buffer.
-    private func renderSpectrogramImageOffline(
-        snapshot: UnsafeMutablePointer<Float>,
-        bins: Int,
-        writeIdx: Int,
-        count: Int,
-        sampleRate: Double
-    ) -> CGImage? {
-        let width = count
-        let height = spectrogramLogRows
-        guard width > 0, let pixelPtr = spectrogramPixels else { return nil }
-
-        ensureRenderRowTablesUpToDate(sampleRate: sampleRate)
-        let rowIdxs = renderRowBinIdx
-        let rowFracs = renderRowBinFrac
-
-        // Chronological start: when the ring is full, begin at the slot we're
-        // about to overwrite (oldest); otherwise start at 0.
-        let startIdx = count < spectrogramMaxFrames ? 0 : writeIdx
-
-        for col in 0..<width {
-            let frameIdx = (startIdx + col) % spectrogramMaxFrames
-            let spectrum = snapshot.advanced(by: frameIdx * bins)
-
-            for row in 0..<height {
-                let binIdx = rowIdxs[row]
-                guard binIdx >= 0, binIdx < bins else { continue }
-                let frac = rowFracs[row]
-                let val0 = spectrum[binIdx]
-                let val1 = binIdx + 1 < bins ? spectrum[binIdx + 1] : val0
-                let magnitude = val0 + frac * (val1 - val0)
-
-                let lutIdx = Int(min(max(magnitude * 255, 0), 255))
-                let (r, g, b) = Self.colorLUT[lutIdx]
-
-                let pixelRow = height - 1 - row
-                let idx = (pixelRow * width + col) * 4
-                pixelPtr[idx] = r
-                pixelPtr[idx + 1] = g
-                pixelPtr[idx + 2] = b
-                pixelPtr[idx + 3] = 255
-            }
-        }
-
-        // Wrap the pre-allocated buffer in CFData by copying once into a
-        // CFData-managed allocation. We can't hand CGImage a non-owned pointer
-        // safely because the next render will mutate it.
-        let byteCount = width * height * 4
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let data = Data(bytes: pixelPtr, count: byteCount)
-        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
-
-        return CGImage(
-            width: width, height: height,
-            bitsPerComponent: 8, bitsPerPixel: 32,
-            bytesPerRow: width * 4,
-            space: colorSpace,
-            bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-            provider: provider,
-            decode: nil, shouldInterpolate: false,
-            intent: .defaultIntent
+    private func updateAnalysisDemand() {
+        pipelineWorker.setNativeVisualizationEnabled(
+            spectrogramEnabled && !visualizationsPaused
+        )
+        pipelineWorker.setRemoteSpectrumSubscribersVisible(
+            remoteSpectrumSubscribersVisible
         )
     }
 
-
-    private static func spectrogramRGBStatic(magnitude: Float) -> (UInt8, UInt8, UInt8) {
-        let c = min(max(magnitude, 0), 1)
-
-        // Smooth gradient color mapping: black → blue → cyan → green → yellow → orange → red
-        // Using smooth polynomial interpolation for natural transitions
-        let r: Float, g: Float, b: Float
-
-        if c < 0.125 {
-            // Black → dark blue
-            let t = c / 0.125
-            let t2 = t * t
-            r = 0
-            g = 0
-            b = 0.4 * t2
-        } else if c < 0.25 {
-            // Dark blue → bright blue
-            let t = (c - 0.125) / 0.125
-            let t2 = t * t
-            r = 0
-            g = 0
-            b = 0.4 + 0.6 * t2
-        } else if c < 0.375 {
-            // Blue → cyan
-            let t = (c - 0.25) / 0.125
-            let t2 = t * t
-            r = 0
-            g = t2
-            b = 1
-        } else if c < 0.5 {
-            // Cyan → cyan-green
-            let t = (c - 0.375) / 0.125
-            r = 0
-            g = 1
-            b = 1 - 0.3 * t * t
-        } else if c < 0.625 {
-            // Cyan-green → green
-            let t = (c - 0.5) / 0.125
-            let t2 = t * t
-            r = 0
-            g = 1
-            b = 0.7 - 0.7 * t2
-        } else if c < 0.75 {
-            // Green → yellow
-            let t = (c - 0.625) / 0.125
-            let t2 = t * t
-            r = t2
-            g = 1
-            b = 0
-        } else if c < 0.875 {
-            // Yellow → orange
-            let t = (c - 0.75) / 0.125
-            let t2 = t * t
-            r = 1
-            g = 1 - 0.5 * t2
-            b = 0
-        } else {
-            // Orange → red
-            let t = (c - 0.875) / 0.125
-            let t2 = t * t
-            r = 1
-            g = 0.5 - 0.5 * t2
-            b = 0
-        }
-
-        return (UInt8(r * 255), UInt8(g * 255), UInt8(b * 255))
-    }
-
-    /// Compute normalized FFT magnitude spectrum (in dB, 0..1) directly into
-    /// `output`. Uses pre-allocated scratch buffers — no per-frame allocations.
-    private func computeFFTSpectrum(
-        samples: UnsafePointer<Float>,
-        count: Int,
-        setup: FFTSetup,
-        output: UnsafeMutablePointer<Float>
-    ) {
-        let halfSize = count / 2
-        guard let realBuf = fftRealBuf, let imagBuf = fftImagBuf else { return }
-
-        var split = DSPSplitComplex(realp: realBuf, imagp: imagBuf)
-
-        samples.withMemoryRebound(to: DSPComplex.self, capacity: halfSize) { complexSamples in
-            vDSP_ctoz(complexSamples, 2, &split, 1, vDSP_Length(halfSize))
-        }
-
-        vDSP_fft_zrip(setup, &split, 1, fftLog2N, FFTDirection(FFT_FORWARD))
-
-        // |z| → output, then scale
-        vDSP_zvabs(&split, 1, output, 1, vDSP_Length(halfSize))
-        var scale: Float = 2.0 / Float(count)
-        vDSP_vsmul(output, 1, &scale, output, 1, vDSP_Length(halfSize))
-
-        // Convert to dB (0..1, -96 dB floor)
-        // Vectorized: faster than per-element operations
-        let invRange: Float = 1.0 / 96.0
-        let minVal: Float = 1e-10
-        for i in 0..<halfSize {
-            let mag = max(output[i], minVal)
-            let db = 20 * log10(mag)
-            var v = (db + 96) * invRange
-            // Inline clip instead of separate vDSP call (same speed, less overhead)
-            if v < 0 { v = 0 } else if v > 1 { v = 1 }
-            output[i] = v
-        }
-    }
-
-    deinit {
-        if let setup = fftSetup {
-            vDSP_destroy_fftsetup(setup)
-        }
-        vizLeftBuf.deallocate()
-        vizRightBuf.deallocate()
-        spectrogramBuffer?.deallocate()
-        spectrogramSnapshot?.deallocate()
-        fftRealBuf?.deallocate()
-        fftImagBuf?.deallocate()
-        fftMagBuf?.deallocate()
-        spectrogramPixels?.deallocate()
-    }
-
     private func stopUIUpdateTimer() {
-        if let displayLink = displayLink {
-            CVDisplayLinkStop(displayLink)
-            self.displayLink = nil
-        }
+        uiUpdateTimer?.setEventHandler {}
+        uiUpdateTimer?.cancel()
+        uiUpdateTimer = nil
     }
 
     // MARK: - Auto-Gain
 
     private var autoGainTimer: Timer?
-    private let autoGainTargetLevel: Float = 0.5  // -6 dBFS (safe headroom)
-    private let autoGainMinLevel: Float = 0.01    // -40 dBFS (ignore very quiet signals)
+    private let autoGainTargetLevel: Float = 0.5  // -6 dBFS RMS
+    private let autoGainMinLevel: Float = 0.001  // -60 dBFS (ignore near-silence)
     private let autoGainSmoothingFactor: Float = 0.1  // Slow, smooth adjustments
 
     func startAutoGain() {
+        guard autoGainTimer == nil else { return }
         autoGainTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-            guard let self = self else { return }
-            self.adjustAutoGain()
+            MainActor.assumeIsolated {
+                self?.adjustAutoGain()
+            }
         }
         if let timer = autoGainTimer {
             RunLoop.current.add(timer, forMode: .common)
@@ -953,225 +1609,706 @@ class AudioMonitor {
     }
 
     private func adjustAutoGain() {
-        guard isAutoGainEnabled, peakLevel > autoGainMinLevel else { return }
+        guard isAutoGainEnabled else { return }
 
-        // Calculate target gain: scale current peak to target level
-        let targetGain = autoGainTargetLevel / peakLevel
+        guard gain.isFinite else {
+            gain = 1
+            sharedState.setGain(gain)
+            return
+        }
+        let currentGain = gain
+        if currentGain <= 0 {
+            // A zero capture gain also produces a zero post-gain meter, so the
+            // normal ratio cannot recover without a deterministic unity seed.
+            gain = 1
+            sharedState.setGain(gain)
+            return
+        }
+        let postGainPeak = sharedState.getAutoGainPeakLevel()
+        guard postGainPeak.isFinite, postGainPeak > autoGainMinLevel else {
+            return
+        }
+
+        // The callback meter is post-gain. Convert its correction ratio back
+        // into an absolute gain target instead of applying it as one.
+        let targetGain =
+            currentGain * autoGainTargetLevel / postGainPeak
 
         // Clamp to reasonable range (0.1x to 4.0x)
         let clampedTarget = max(0.1, min(4.0, targetGain))
 
         // Smoothly interpolate current gain toward target
-        gain += autoGainSmoothingFactor * (clampedTarget - gain)
+        gain =
+            currentGain
+            + autoGainSmoothingFactor * (clampedTarget - currentGain)
 
-        // Update passthrough volume if enabled
+        // Capture gain feeds meters, recordings, network streams, and local
+        // output, so publish it even when no passthrough device is active.
+        sharedState.setGain(gain)
         if isPassthroughEnabled {
-            sharedState.setGain(gain)
-            sharedState.setVolume(gain)
+            sharedState.setVolume(1)
         }
     }
 }
 
-// MARK: - Ring Buffer (no internal locking — caller synchronizes)
+// MARK: - Lock-free stereo rings
 
-private class RingBuffer {
-    private let buffer: UnsafeMutablePointer<Float>
-    private let capacity: Int
-    private var writePos = 0
-    private var readPos = 0
-    private(set) var available = 0
+nonisolated private final class VisualizationBuffers: @unchecked Sendable {
+    let left: UnsafeMutablePointer<Float>
+    let right: UnsafeMutablePointer<Float>
 
     init(capacity: Int) {
-        self.capacity = capacity
-        buffer = .allocate(capacity: capacity)
-        buffer.initialize(repeating: 0, count: capacity)
+        left = .allocate(capacity: capacity)
+        right = .allocate(capacity: capacity)
+        left.initialize(repeating: 0, count: capacity)
+        right.initialize(repeating: 0, count: capacity)
     }
 
-    deinit { buffer.deallocate() }
+    deinit {
+        left.deallocate()
+        right.deallocate()
+    }
+}
+
+/// Single-producer/single-consumer stereo ring. The input callback is the only
+/// producer and the output callback is the only consumer.
+nonisolated private final class RealtimeStereoRing: @unchecked Sendable {
+    private let left: UnsafeMutablePointer<Float>
+    private let right: UnsafeMutablePointer<Float>
+    private let capacity: UInt64
+    private let writeSequence = Atomic<UInt64>(0)
+    private let readSequence = Atomic<UInt64>(0)
+    private let overflowCount = Atomic<UInt64>(0)
+    private let underrunCount = Atomic<UInt64>(0)
+
+    init(capacity: Int) {
+        self.capacity = UInt64(max(capacity, 2))
+        left = .allocate(capacity: Int(self.capacity))
+        right = .allocate(capacity: Int(self.capacity))
+        left.initialize(repeating: 0, count: Int(self.capacity))
+        right.initialize(repeating: 0, count: Int(self.capacity))
+    }
+
+    deinit {
+        left.deallocate()
+        right.deallocate()
+    }
+
+    func write(
+        left sourceLeft: UnsafePointer<Float>,
+        right sourceRight: UnsafePointer<Float>,
+        count requestedCount: Int
+    ) {
+        guard requestedCount > 0 else { return }
+        let write = writeSequence.load(ordering: .relaxed)
+        let read = readSequence.load(ordering: .acquiring)
+        let used = min(write &- read, capacity)
+        let available = capacity &- used
+        let count = min(UInt64(requestedCount), available)
+        guard count > 0 else {
+            overflowCount.wrappingAdd(
+                UInt64(requestedCount),
+                ordering: .relaxed
+            )
+            return
+        }
+
+        copyIntoRing(
+            destination: left,
+            source: sourceLeft,
+            sequence: write,
+            count: Int(count)
+        )
+        copyIntoRing(
+            destination: right,
+            source: sourceRight,
+            sequence: write,
+            count: Int(count)
+        )
+        writeSequence.store(write &+ count, ordering: .releasing)
+        if count < UInt64(requestedCount) {
+            overflowCount.wrappingAdd(
+                UInt64(requestedCount) &- count,
+                ordering: .relaxed
+            )
+        }
+    }
+
+    func read(
+        left destinationLeft: UnsafeMutablePointer<Float>,
+        right destinationRight: UnsafeMutablePointer<Float>,
+        count requestedCount: Int
+    ) -> Int {
+        guard requestedCount > 0 else { return 0 }
+        let read = readSequence.load(ordering: .relaxed)
+        let write = writeSequence.load(ordering: .acquiring)
+        let available = min(write &- read, capacity)
+        let count = min(UInt64(requestedCount), available)
+        if count > 0 {
+            copyFromRing(
+                source: left,
+                destination: destinationLeft,
+                sequence: read,
+                count: Int(count)
+            )
+            copyFromRing(
+                source: right,
+                destination: destinationRight,
+                sequence: read,
+                count: Int(count)
+            )
+            readSequence.store(read &+ count, ordering: .releasing)
+        }
+        if count < UInt64(requestedCount) {
+            let missing = requestedCount - Int(count)
+            memset(
+                destinationLeft + Int(count),
+                0,
+                missing * MemoryLayout<Float>.stride
+            )
+            memset(
+                destinationRight + Int(count),
+                0,
+                missing * MemoryLayout<Float>.stride
+            )
+            underrunCount.wrappingAdd(1, ordering: .relaxed)
+        }
+        return Int(count)
+    }
+
+    func fillLevel() -> Int {
+        let read = readSequence.load(ordering: .acquiring)
+        let write = writeSequence.load(ordering: .acquiring)
+        return Int(min(write &- read, capacity))
+    }
 
     func reset() {
-        writePos = 0
-        readPos = 0
-        available = 0
+        let write = writeSequence.load(ordering: .acquiring)
+        readSequence.store(write, ordering: .releasing)
     }
 
-    func write(_ data: UnsafePointer<Float>, count: Int) {
-        let toWrite = min(count, capacity)
-        let firstChunk = min(toWrite, capacity - writePos)
-        memcpy(buffer + writePos, data, firstChunk * MemoryLayout<Float>.stride)
-        if firstChunk < toWrite {
-            memcpy(buffer, data + firstChunk, (toWrite - firstChunk) * MemoryLayout<Float>.stride)
-        }
-        writePos = (writePos + toWrite) % capacity
+    var overflows: UInt64 {
+        overflowCount.load(ordering: .relaxed)
+    }
 
-        // Advance read pointer if we overwrote unread data
-        available += toWrite
-        if available > capacity {
-            let overflow = available - capacity
-            readPos = (readPos + overflow) % capacity
-            available = capacity
+    var underruns: UInt64 {
+        underrunCount.load(ordering: .relaxed)
+    }
+
+    private func copyIntoRing(
+        destination: UnsafeMutablePointer<Float>,
+        source: UnsafePointer<Float>,
+        sequence: UInt64,
+        count: Int
+    ) {
+        let start = Int(sequence % capacity)
+        let first = min(count, Int(capacity) - start)
+        memcpy(
+            destination + start,
+            source,
+            first * MemoryLayout<Float>.stride
+        )
+        if first < count {
+            memcpy(
+                destination,
+                source + first,
+                (count - first) * MemoryLayout<Float>.stride
+            )
         }
     }
 
-    func read(_ data: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        let toRead = min(count, available)
-        let firstChunk = min(toRead, capacity - readPos)
-        memcpy(data, buffer + readPos, firstChunk * MemoryLayout<Float>.stride)
-        if firstChunk < toRead {
-            memcpy(data + firstChunk, buffer, (toRead - firstChunk) * MemoryLayout<Float>.stride)
+    private func copyFromRing(
+        source: UnsafePointer<Float>,
+        destination: UnsafeMutablePointer<Float>,
+        sequence: UInt64,
+        count: Int
+    ) {
+        let start = Int(sequence % capacity)
+        let first = min(count, Int(capacity) - start)
+        memcpy(
+            destination,
+            source + start,
+            first * MemoryLayout<Float>.stride
+        )
+        if first < count {
+            memcpy(
+                destination + first,
+                source,
+                (count - first) * MemoryLayout<Float>.stride
+            )
         }
-        readPos = (readPos + toRead) % capacity
-        available -= toRead
-        if toRead < count {
-            memset(data + toRead, 0, (count - toRead) * MemoryLayout<Float>.stride)
-        }
-        return toRead
+    }
+}
+
+/// Single-producer snapshot ring for meters and spectrum analysis. It is
+/// intentionally independent from playback, so output consumption cannot make
+/// the spectrogram freeze.
+nonisolated private final class AnalysisStereoRing: @unchecked Sendable {
+    private let left: UnsafeMutablePointer<Float>
+    private let right: UnsafeMutablePointer<Float>
+    private let capacity: UInt64
+    private let writeSequence = Atomic<UInt64>(0)
+    private let readSequence = Atomic<UInt64>(0)
+    private let dropCount = Atomic<UInt64>(0)
+
+    init(capacity: Int) {
+        self.capacity = UInt64(max(capacity, 2))
+        left = .allocate(capacity: Int(self.capacity))
+        right = .allocate(capacity: Int(self.capacity))
+        left.initialize(repeating: 0, count: Int(self.capacity))
+        right.initialize(repeating: 0, count: Int(self.capacity))
     }
 
-    // Peek at most recent data without consuming it
-    func peekRecent(_ data: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        let toPeek = min(count, available)
-        guard toPeek > 0 else { return 0 }
+    deinit {
+        left.deallocate()
+        right.deallocate()
+    }
 
-        // Calculate starting position for most recent samples
-        let peekStart = (writePos - toPeek + capacity) % capacity
-        let firstChunk = min(toPeek, capacity - peekStart)
-        memcpy(data, buffer + peekStart, firstChunk * MemoryLayout<Float>.stride)
-        if firstChunk < toPeek {
-            memcpy(data + firstChunk, buffer, (toPeek - firstChunk) * MemoryLayout<Float>.stride)
+    func write(
+        left sourceLeft: UnsafePointer<Float>,
+        right sourceRight: UnsafePointer<Float>,
+        count requestedCount: Int
+    ) {
+        guard requestedCount > 0 else { return }
+        let sequence = writeSequence.load(ordering: .relaxed)
+        let read = readSequence.load(ordering: .acquiring)
+        let used = min(sequence &- read, capacity)
+        let count = min(UInt64(requestedCount), capacity &- used)
+        guard count > 0 else {
+            dropCount.wrappingAdd(
+                UInt64(requestedCount),
+                ordering: .relaxed
+            )
+            return
         }
-        return toPeek
+        copyIntoRing(
+            destination: left,
+            source: sourceLeft,
+            sequence: sequence,
+            count: Int(count)
+        )
+        copyIntoRing(
+            destination: right,
+            source: sourceRight,
+            sequence: sequence,
+            count: Int(count)
+        )
+        writeSequence.store(sequence &+ count, ordering: .releasing)
+        if count < UInt64(requestedCount) {
+            dropCount.wrappingAdd(
+                UInt64(requestedCount) &- count,
+                ordering: .relaxed
+            )
+        }
+    }
+
+    func peekRecent(
+        left destinationLeft: UnsafeMutablePointer<Float>,
+        right destinationRight: UnsafeMutablePointer<Float>,
+        count requestedCount: Int
+    ) -> Int {
+        guard requestedCount > 0 else { return 0 }
+        let read = readSequence.load(ordering: .relaxed)
+        let end = writeSequence.load(ordering: .acquiring)
+        let available = min(end &- read, capacity)
+        let count = min(UInt64(requestedCount), available)
+        guard count > 0 else { return 0 }
+        let start = end &- count
+        copyFromRing(
+            source: left,
+            destination: destinationLeft,
+            sequence: start,
+            count: Int(count)
+        )
+        copyFromRing(
+            source: right,
+            destination: destinationRight,
+            sequence: start,
+            count: Int(count)
+        )
+        readSequence.store(end, ordering: .releasing)
+        return Int(count)
+    }
+
+    var droppedFrames: UInt64 {
+        dropCount.load(ordering: .relaxed)
+    }
+
+    func reset() {
+        let write = writeSequence.load(ordering: .acquiring)
+        readSequence.store(write, ordering: .releasing)
+    }
+
+    private func copyIntoRing(
+        destination: UnsafeMutablePointer<Float>,
+        source: UnsafePointer<Float>,
+        sequence: UInt64,
+        count: Int
+    ) {
+        let start = Int(sequence % capacity)
+        let first = min(count, Int(capacity) - start)
+        memcpy(destination + start, source, first * MemoryLayout<Float>.stride)
+        if first < count {
+            memcpy(
+                destination,
+                source + first,
+                (count - first) * MemoryLayout<Float>.stride
+            )
+        }
+    }
+
+    private func copyFromRing(
+        source: UnsafePointer<Float>,
+        destination: UnsafeMutablePointer<Float>,
+        sequence: UInt64,
+        count: Int
+    ) {
+        let start = Int(sequence % capacity)
+        let first = min(count, Int(capacity) - start)
+        memcpy(destination, source + start, first * MemoryLayout<Float>.stride)
+        if first < count {
+            memcpy(
+                destination + first,
+                source,
+                (count - first) * MemoryLayout<Float>.stride
+            )
+        }
     }
 }
 
 // MARK: - Shared Audio State
 
-private class SharedAudioState {
-    // Stereo ring buffers with a single lock for atomic L/R access
-    private var ringLock = os_unfair_lock()
-    private var leftRing = RingBuffer(capacity: AudioConfig.ringCapacity)
-    private var rightRing = RingBuffer(capacity: AudioConfig.ringCapacity)
+/// Lock-free callback admission gate. Teardown first closes admission and then
+/// waits for callbacks that already passed the gate. A callback arriving after
+/// closure may touch the retained gate object, but it cannot touch audio
+/// buffers or rings.
+nonisolated private final class RealtimeCallbackGate: @unchecked Sendable {
+    private let enabled = Atomic<Bool>(false)
+    private let activeCallbacks = Atomic<UInt32>(0)
 
-    // Parameter lock — protects gain, volume, metering, peak, and EQ coefficient transfer
-    private var paramLock = os_unfair_lock()
-    private var _smoothedPeak: Float = 0
-    private var _volume: Float = 0
-    private var _gain: Float = 1.0
-    private var _meteringEnabled: Bool = false
+    func activate() {
+        enabled.store(true, ordering: .sequentiallyConsistent)
+    }
 
-    // EQ coefficient staging area — written by main thread, read by audio thread
-    // Layout: band * 5 + coeff_index → [b0, b1, b2, a1, a2] per band
+    func begin() -> Bool {
+        activeCallbacks.wrappingAdd(
+            1,
+            ordering: .sequentiallyConsistent
+        )
+        guard enabled.load(ordering: .sequentiallyConsistent) else {
+            activeCallbacks.wrappingSubtract(
+                1,
+                ordering: .sequentiallyConsistent
+            )
+            return false
+        }
+        return true
+    }
+
+    func end() {
+        activeCallbacks.wrappingSubtract(
+            1,
+            ordering: .sequentiallyConsistent
+        )
+    }
+
+    func deactivateAndWait() {
+        enabled.store(false, ordering: .sequentiallyConsistent)
+        while activeCallbacks.load(ordering: .sequentiallyConsistent)
+            != 0
+        {
+            usleep(50)
+        }
+    }
+}
+
+/// The AudioUnit owns one retained callback context. During ordinary retries
+/// it keeps the shared pipeline alive. If disposal fails during monitor deinit,
+/// the context is detached so only this small no-op sentinel remains reachable
+/// from Core Audio.
+nonisolated private final class AudioCallbackContext: @unchecked Sendable {
+    private let gate = RealtimeCallbackGate()
+    private var state: SharedAudioState?
+
+    init(state: SharedAudioState) {
+        self.state = state
+    }
+
+    func activate() {
+        gate.activate()
+    }
+
+    func begin() -> SharedAudioState? {
+        guard gate.begin() else { return nil }
+        guard let state else {
+            gate.end()
+            return nil
+        }
+        return state
+    }
+
+    func end() {
+        gate.end()
+    }
+
+    func deactivateAndWait() {
+        gate.deactivateAndWait()
+    }
+
+    func detachState() {
+        gate.deactivateAndWait()
+        state = nil
+    }
+}
+
+nonisolated final class SharedAudioState: @unchecked Sendable {
+    private let playbackRing = RealtimeStereoRing(capacity: AudioConfig.ringCapacity)
+    private let visualizationRing = AnalysisStereoRing(capacity: AudioConfig.ringCapacity)
+    private let pipelineWorker: AudioPipelineWorker
+    let audioUnitRuntime: any AudioUnitHALRuntime
+
+    private let smoothedPeak = Atomic<Float>(0)
+    private let autoGainPeak = Atomic<Float>(0)
+    private let volume = Atomic<Float>(0)
+    private let gain = Atomic<Float>(1)
+    private let meteringEnabled = Atomic<Bool>(false)
+    private let playbackEnabled = Atomic<Bool>(false)
+
+    // Three fixed coefficient slots allow the main actor to publish rapid EQ
+    // changes without ever overwriting the slot currently copied by the audio
+    // callback. No allocation or lock is needed on either side.
     private let eqCoeffsStaging: UnsafeMutablePointer<Float>
-    private var eqVersion: UInt32 = 0
-    private var eqActive: Bool = false
+    private let eqPublishedSlot = Atomic<Int>(0)
+    private let eqReaderSlot = Atomic<Int>(-1)
+    private let eqVersion = Atomic<UInt32>(0)
+    private let eqActive = Atomic<Bool>(false)
 
-    // EQ processing state — only touched by the input callback thread
-    let eqCoeffs: UnsafeMutablePointer<Float>      // 10 bands × 5 coefficients = 50 floats
-    let eqStateL: UnsafeMutablePointer<Float>       // 10 bands × 2 state vars = 20 floats
-    let eqStateR: UnsafeMutablePointer<Float>       // 10 bands × 2 state vars = 20 floats
+    let eqCoeffs: UnsafeMutablePointer<Float>
+    let eqStateL: UnsafeMutablePointer<Float>
+    let eqStateR: UnsafeMutablePointer<Float>
     var cachedEqVersion: UInt32 = 0
     var cachedEqActive: Bool = false
 
-    var streamServerPtr: UnsafeMutableRawPointer?
-    var recorderPtr: UnsafeMutableRawPointer?
     var inputUnit: AudioUnit?
     var channelCount: Int = 2
     var sameDevice: Bool = false
 
-    // DC offset filter state (input callback thread only)
     var dcLeftPrevX: Float = 0
     var dcLeftPrevY: Float = 0
     var dcRightPrevX: Float = 0
     var dcRightPrevY: Float = 0
     var dcFilterR: Float = 0.9972
 
-    // Pre-allocated work buffers
-    private static let cap = AudioConfig.workCapacity
-    let workLeft: UnsafeMutablePointer<Float>
-    let workRight: UnsafeMutablePointer<Float>
-    let workInterleaved: UnsafeMutablePointer<Float>
-    let workOutL: UnsafeMutablePointer<Float>
-    let workOutR: UnsafeMutablePointer<Float>
+    private(set) var inputCapacity = AudioConfig.workCapacity
+    private(set) var outputCapacity = AudioConfig.workCapacity
+    private(set) var workLeft: UnsafeMutablePointer<Float>
+    private(set) var workRight: UnsafeMutablePointer<Float>
+    private(set) var workOutL: UnsafeMutablePointer<Float>
+    private(set) var workOutR: UnsafeMutablePointer<Float>
+    private let inputOverflowCount = Atomic<UInt64>(0)
+    private let renderFailureStatus = Atomic<OSStatus>(noErr)
+    private let completedCallbackCount = Atomic<UInt64>(0)
+    private let maximumCallbackNanoseconds = Atomic<UInt64>(0)
 
-    init() {
-        let c = SharedAudioState.cap
-        workLeft = .allocate(capacity: c); workLeft.initialize(repeating: 0, count: c)
-        workRight = .allocate(capacity: c); workRight.initialize(repeating: 0, count: c)
-        workInterleaved = .allocate(capacity: c * 2); workInterleaved.initialize(repeating: 0, count: c * 2)
-        workOutL = .allocate(capacity: c); workOutL.initialize(repeating: 0, count: c)
-        workOutR = .allocate(capacity: c); workOutR.initialize(repeating: 0, count: c)
+    init(
+        pipelineWorker: AudioPipelineWorker,
+        audioUnitRuntime: any AudioUnitHALRuntime
+    ) {
+        self.pipelineWorker = pipelineWorker
+        self.audioUnitRuntime = audioUnitRuntime
+        let capacity = AudioConfig.workCapacity
+        workLeft = .allocate(capacity: capacity)
+        workRight = .allocate(capacity: capacity)
+        workOutL = .allocate(capacity: capacity)
+        workOutR = .allocate(capacity: capacity)
+        workLeft.initialize(repeating: 0, count: capacity)
+        workRight.initialize(repeating: 0, count: capacity)
+        workOutL.initialize(repeating: 0, count: capacity)
+        workOutR.initialize(repeating: 0, count: capacity)
 
-        let coeffCount = AudioConfig.eqBandCount * 5
+        let coefficientCount = AudioConfig.eqBandCount * 5
         let stateCount = AudioConfig.eqBandCount * 2
-        eqCoeffsStaging = .allocate(capacity: coeffCount); eqCoeffsStaging.initialize(repeating: 0, count: coeffCount)
-        eqCoeffs = .allocate(capacity: coeffCount); eqCoeffs.initialize(repeating: 0, count: coeffCount)
-        eqStateL = .allocate(capacity: stateCount); eqStateL.initialize(repeating: 0, count: stateCount)
-        eqStateR = .allocate(capacity: stateCount); eqStateR.initialize(repeating: 0, count: stateCount)
+        eqCoeffsStaging = .allocate(
+            capacity: coefficientCount * AudioConfig.eqPublicationSlotCount
+        )
+        eqCoeffsStaging.initialize(
+            repeating: 0,
+            count: coefficientCount * AudioConfig.eqPublicationSlotCount
+        )
+        eqCoeffs = .allocate(capacity: coefficientCount)
+        eqCoeffs.initialize(repeating: 0, count: coefficientCount)
+        eqStateL = .allocate(capacity: stateCount)
+        eqStateL.initialize(repeating: 0, count: stateCount)
+        eqStateR = .allocate(capacity: stateCount)
+        eqStateR.initialize(repeating: 0, count: stateCount)
 
-        // Initialize all bands to unity passthrough: b0=1, rest=0
-        for i in 0..<AudioConfig.eqBandCount {
-            eqCoeffsStaging[i * 5] = 1.0
-            eqCoeffs[i * 5] = 1.0
+        for slot in 0..<AudioConfig.eqPublicationSlotCount {
+            for band in 0..<AudioConfig.eqBandCount {
+                eqCoeffsStaging[slot * coefficientCount + band * 5] = 1
+            }
+        }
+        for band in 0..<AudioConfig.eqBandCount {
+            eqCoeffs[band * 5] = 1
         }
     }
 
     deinit {
-        workLeft.deallocate(); workRight.deallocate()
-        workInterleaved.deallocate()
-        workOutL.deallocate(); workOutR.deallocate()
-        eqCoeffsStaging.deallocate(); eqCoeffs.deallocate()
-        eqStateL.deallocate(); eqStateR.deallocate()
+        workLeft.deallocate()
+        workRight.deallocate()
+        workOutL.deallocate()
+        workOutR.deallocate()
+        eqCoeffsStaging.deallocate()
+        eqCoeffs.deallocate()
+        eqStateL.deallocate()
+        eqStateR.deallocate()
     }
 
-    // MARK: - DC Filter
+    func prepareInputCapacity(_ requested: Int) {
+        let capacity = max(requested, AudioConfig.workCapacity)
+        guard capacity != inputCapacity else { return }
+        workLeft.deallocate()
+        workRight.deallocate()
+        workLeft = .allocate(capacity: capacity)
+        workRight = .allocate(capacity: capacity)
+        workLeft.initialize(repeating: 0, count: capacity)
+        workRight.initialize(repeating: 0, count: capacity)
+        inputCapacity = capacity
+    }
+
+    func prepareOutputCapacity(_ requested: Int) {
+        let capacity = max(requested, AudioConfig.workCapacity)
+        guard capacity != outputCapacity else { return }
+        workOutL.deallocate()
+        workOutR.deallocate()
+        workOutL = .allocate(capacity: capacity)
+        workOutR = .allocate(capacity: capacity)
+        workOutL.initialize(repeating: 0, count: capacity)
+        workOutR.initialize(repeating: 0, count: capacity)
+        outputCapacity = capacity
+    }
+
+    func recordInputOverflow() {
+        inputOverflowCount.wrappingAdd(1, ordering: .relaxed)
+    }
+
+    func recordRenderFailure(_ status: OSStatus) {
+        guard status != noErr else { return }
+        _ = renderFailureStatus.compareExchange(
+            expected: noErr,
+            desired: status,
+            ordering: .relaxed
+        )
+    }
+
+    func takeRenderFailure() -> OSStatus {
+        renderFailureStatus.exchange(
+            noErr,
+            ordering: .acquiringAndReleasing
+        )
+    }
+
+    var callbackOverflows: UInt64 {
+        inputOverflowCount.load(ordering: .relaxed)
+            &+ playbackRing.overflows
+            &+ visualizationRing.droppedFrames
+    }
+
+    var playbackOverflows: UInt64 {
+        playbackRing.overflows
+    }
+
+    var playbackUnderruns: UInt64 {
+        playbackRing.underruns
+    }
+
+    var callbackCount: UInt64 {
+        completedCallbackCount.load(ordering: .relaxed)
+    }
+
+    var maximumCallbackDurationNanoseconds: UInt64 {
+        maximumCallbackNanoseconds.load(ordering: .relaxed)
+    }
+
+    func recordCallbackDuration(nanoseconds: UInt64) {
+        completedCallbackCount.wrappingAdd(1, ordering: .relaxed)
+        var maximum = maximumCallbackNanoseconds.load(ordering: .relaxed)
+        while nanoseconds > maximum {
+            let result = maximumCallbackNanoseconds.compareExchange(
+                expected: maximum,
+                desired: nanoseconds,
+                ordering: .relaxed
+            )
+            if result.exchanged {
+                break
+            }
+            maximum = result.original
+        }
+    }
 
     func updateDCFilterCoefficient(sampleRate: Float) {
         dcFilterR = expf(-2.0 * Float.pi * 20.0 / sampleRate)
     }
 
-    // MARK: - EQ Coefficient Computation
-
     func updateEQCoefficients(bands: [Float], sampleRate: Float) {
         guard sampleRate > 0 else { return }
-        let active = !bands.allSatisfy { $0 == 0 }
+        let nyquistFrequency = sampleRate * 0.5
+        var active = false
+        let currentSlot = eqPublishedSlot.load(ordering: .acquiring)
+        let readerSlot = eqReaderSlot.load(ordering: .acquiring)
+        let nextSlot =
+            (0..<AudioConfig.eqPublicationSlotCount).first {
+                $0 != currentSlot && $0 != readerSlot
+            }!
+        let coefficientCount = AudioConfig.eqBandCount * 5
+        let slot = eqCoeffsStaging + nextSlot * coefficientCount
 
-        os_unfair_lock_lock(&paramLock)
-        for i in 0..<min(bands.count, AudioConfig.eqBandCount) {
+        for index in 0..<AudioConfig.eqBandCount {
+            let frequency = AudioConfig.eqFrequencies[index]
+            let requestedGain = index < bands.count ? bands[index] : 0
+            // A peaking filter centered at or above Nyquist is undefined for
+            // the requested analog band and can produce unstable poles.
+            // Bypass that band rather than folding it into audible spectrum.
+            let gain =
+                frequency < nyquistFrequency
+                    && requestedGain.isFinite
+                ? requestedGain
+                : 0
+            active = active || gain != 0
             let (b0, b1, b2, a1, a2) = computePeakingEQ(
-                freq: AudioConfig.eqFrequencies[i],
-                gainDB: bands[i],
-                Q: AudioConfig.eqQ,
+                freq: frequency,
+                gainDB: gain,
+                q: AudioConfig.eqQ,
                 sampleRate: sampleRate
             )
-            let base = i * 5
-            eqCoeffsStaging[base]     = b0
-            eqCoeffsStaging[base + 1] = b1
-            eqCoeffsStaging[base + 2] = b2
-            eqCoeffsStaging[base + 3] = a1
-            eqCoeffsStaging[base + 4] = a2
+            let base = index * 5
+            slot[base] = b0
+            slot[base + 1] = b1
+            slot[base + 2] = b2
+            slot[base + 3] = a1
+            slot[base + 4] = a2
         }
-        eqVersion &+= 1
-        eqActive = active
-        os_unfair_lock_unlock(&paramLock)
+        eqActive.store(active, ordering: .relaxed)
+        eqPublishedSlot.store(nextSlot, ordering: .releasing)
+        eqVersion.wrappingAdd(1, ordering: .releasing)
     }
 
     /// Audio EQ Cookbook peaking EQ — Robert Bristow-Johnson
     private func computePeakingEQ(
-        freq: Float, gainDB: Float, Q: Float, sampleRate: Float
+        freq: Float, gainDB: Float, q: Float, sampleRate: Float
     ) -> (Float, Float, Float, Float, Float) {
         if gainDB == 0 { return (1, 0, 0, 0, 0) }
-        let A = powf(10, gainDB / 40.0)
+        let amplitude = powf(10, gainDB / 40.0)
         let w0 = 2.0 * Float.pi * freq / sampleRate
         let sinW0 = sinf(w0)
         let cosW0 = cosf(w0)
-        let alpha = sinW0 / (2.0 * Q)
+        let alpha = sinW0 / (2.0 * q)
 
-        let b0 =  1.0 + alpha * A
+        let b0 = 1.0 + alpha * amplitude
         let b1 = -2.0 * cosW0
-        let b2 =  1.0 - alpha * A
-        let a0 =  1.0 + alpha / A
+        let b2 = 1.0 - alpha * amplitude
+        let a0 = 1.0 + alpha / amplitude
         let a1 = -2.0 * cosW0
-        let a2 =  1.0 - alpha / A
+        let a2 = 1.0 - alpha / amplitude
 
         let invA0 = 1.0 / a0
         return (b0 * invA0, b1 * invA0, b2 * invA0, a1 * invA0, a2 * invA0)
@@ -1179,27 +2316,42 @@ private class SharedAudioState {
 
     // Called from input callback to sync coefficients if version changed
     func syncEQCoefficients() {
-        os_unfair_lock_lock(&paramLock)
-        let version = eqVersion
-        let active = eqActive
+        let version = eqVersion.load(ordering: .acquiring)
         if version != cachedEqVersion {
-            memcpy(eqCoeffs, eqCoeffsStaging, AudioConfig.eqBandCount * 5 * MemoryLayout<Float>.stride)
+            let coefficientCount = AudioConfig.eqBandCount * 5
+            var slot: Int
+            while true {
+                slot = eqPublishedSlot.load(ordering: .acquiring)
+                eqReaderSlot.store(slot, ordering: .releasing)
+                if eqPublishedSlot.load(ordering: .acquiring) == slot {
+                    break
+                }
+                eqReaderSlot.store(-1, ordering: .releasing)
+            }
+            memcpy(
+                eqCoeffs,
+                eqCoeffsStaging + slot * coefficientCount,
+                coefficientCount * MemoryLayout<Float>.stride
+            )
+            eqReaderSlot.store(-1, ordering: .releasing)
             cachedEqVersion = version
         }
-        cachedEqActive = active
-        os_unfair_lock_unlock(&paramLock)
+        cachedEqActive = eqActive.load(ordering: .relaxed)
     }
 
     // MARK: - Parameter Access
 
     func setVolume(_ vol: Float) {
-        os_unfair_lock_lock(&paramLock); _volume = vol; os_unfair_lock_unlock(&paramLock)
+        volume.store(vol, ordering: .relaxed)
     }
     func setGain(_ gain: Float) {
-        os_unfair_lock_lock(&paramLock); _gain = gain; os_unfair_lock_unlock(&paramLock)
+        self.gain.store(gain, ordering: .relaxed)
     }
     func setMeteringEnabled(_ enabled: Bool) {
-        os_unfair_lock_lock(&paramLock); _meteringEnabled = enabled; os_unfair_lock_unlock(&paramLock)
+        meteringEnabled.store(enabled, ordering: .relaxed)
+    }
+    func setPlaybackEnabled(_ enabled: Bool) {
+        playbackEnabled.store(enabled, ordering: .releasing)
     }
 
     struct AudioParams {
@@ -1209,84 +2361,88 @@ private class SharedAudioState {
     }
 
     func getParams() -> AudioParams {
-        os_unfair_lock_lock(&paramLock)
-        let p = AudioParams(gain: _gain, volume: _volume, meteringEnabled: _meteringEnabled)
-        os_unfair_lock_unlock(&paramLock)
-        return p
+        AudioParams(
+            gain: gain.load(ordering: .relaxed),
+            volume: volume.load(ordering: .relaxed),
+            meteringEnabled: meteringEnabled.load(ordering: .relaxed)
+        )
     }
 
     func getPeakLevel() -> Float {
-        os_unfair_lock_lock(&paramLock); let p = _smoothedPeak; os_unfair_lock_unlock(&paramLock)
-        return p
+        smoothedPeak.load(ordering: .relaxed)
+    }
+
+    func getAutoGainPeakLevel() -> Float {
+        autoGainPeak.load(ordering: .relaxed)
+    }
+
+    var isEQActive: Bool {
+        eqActive.load(ordering: .acquiring)
     }
 
     func updatePeak(rms: Float, gain: Float) {
+        let postGainRMS = min(max(rms * gain, 0), 1)
+        autoGainPeak.store(postGainRMS, ordering: .relaxed)
         let rawLevel = min(rms * 4.0, 1.0)
         let level = min(rawLevel * gain, 1.0)
-        os_unfair_lock_lock(&paramLock)
-        let coeff: Float = level > _smoothedPeak ? 0.85 : 0.25
-        _smoothedPeak += coeff * (level - _smoothedPeak)
-        os_unfair_lock_unlock(&paramLock)
+        let previous = smoothedPeak.load(ordering: .relaxed)
+        let coefficient: Float = level > previous ? 0.85 : 0.25
+        smoothedPeak.store(
+            previous + coefficient * (level - previous),
+            ordering: .relaxed
+        )
     }
 
     // MARK: - Stereo Ring Buffer (atomic L/R operations)
 
-    func writeStereo(left: UnsafePointer<Float>, right: UnsafePointer<Float>, count: Int) {
-        os_unfair_lock_lock(&ringLock)
-        leftRing.write(left, count: count)
-        rightRing.write(right, count: count)
-        os_unfair_lock_unlock(&ringLock)
+    func writeStereo(
+        left: UnsafePointer<Float>,
+        right: UnsafePointer<Float>,
+        count: Int,
+        captureTimestampNanoseconds: UInt64
+    ) {
+        if playbackEnabled.load(ordering: .acquiring) {
+            playbackRing.write(left: left, right: right, count: count)
+        }
+        visualizationRing.write(left: left, right: right, count: count)
+        pipelineWorker.enqueue(
+            left: left,
+            right: right,
+            count: count,
+            captureTimestampNanoseconds: captureTimestampNanoseconds
+        )
     }
 
     func readStereo(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        os_unfair_lock_lock(&ringLock)
-        let avail = min(leftRing.available, rightRing.available)
-        let toRead = min(count, avail)
-        _ = leftRing.read(left, count: toRead)
-        _ = rightRing.read(right, count: toRead)
-        os_unfair_lock_unlock(&ringLock)
-        if toRead < count {
-            memset(left + toRead, 0, (count - toRead) * MemoryLayout<Float>.stride)
-            memset(right + toRead, 0, (count - toRead) * MemoryLayout<Float>.stride)
-        }
-        return toRead
+        playbackRing.read(left: left, right: right, count: count)
     }
 
     func ringFillLevel() -> Int {
-        os_unfair_lock_lock(&ringLock)
-        let fill = min(leftRing.available, rightRing.available)
-        os_unfair_lock_unlock(&ringLock)
-        return fill
+        playbackRing.fillLevel()
     }
 
     func peekStereoRecent(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>, count: Int) -> Int {
-        os_unfair_lock_lock(&ringLock)
-        let avail = min(leftRing.available, rightRing.available)
-        let toPeek = min(count, avail)
-        _ = leftRing.peekRecent(left, count: toPeek)
-        _ = rightRing.peekRecent(right, count: toPeek)
-        os_unfair_lock_unlock(&ringLock)
-        if toPeek < count {
-            memset(left + toPeek, 0, (count - toPeek) * MemoryLayout<Float>.stride)
-            memset(right + toPeek, 0, (count - toPeek) * MemoryLayout<Float>.stride)
-        }
-        return toPeek
+        visualizationRing.peekRecent(left: left, right: right, count: count)
+    }
+
+    func resetPlayback() {
+        playbackRing.reset()
     }
 
     func reset() {
-        os_unfair_lock_lock(&paramLock)
-        _smoothedPeak = 0
-        _volume = 0
-        os_unfair_lock_unlock(&paramLock)
-
-        os_unfair_lock_lock(&ringLock)
-        leftRing.reset()
-        rightRing.reset()
-        os_unfair_lock_unlock(&ringLock)
+        smoothedPeak.store(0, ordering: .relaxed)
+        autoGainPeak.store(0, ordering: .relaxed)
+        renderFailureStatus.store(noErr, ordering: .relaxed)
+        volume.store(0, ordering: .relaxed)
+        playbackEnabled.store(false, ordering: .releasing)
+        playbackRing.reset()
+        visualizationRing.reset()
 
         inputUnit = nil
-        dcLeftPrevX = 0; dcLeftPrevY = 0
-        dcRightPrevX = 0; dcRightPrevY = 0
+        dcLeftPrevX = 0
+        dcLeftPrevY = 0
+        dcRightPrevX = 0
+        dcRightPrevY = 0
 
         // Reset EQ filter state
         let stateCount = AudioConfig.eqBandCount * 2
@@ -1300,15 +2456,19 @@ private class SharedAudioState {
 /// Process a single biquad section (Transposed Direct Form II)
 /// Coefficients at coeffs[0..4] = [b0, b1, b2, a1, a2]
 /// State at state[0..1] = [z1, z2]
-private func processBiquad(
+nonisolated private func processBiquad(
     _ buffer: UnsafeMutablePointer<Float>,
     count: Int,
     coeffs: UnsafePointer<Float>,
     state: UnsafeMutablePointer<Float>
 ) {
-    let b0 = coeffs[0], b1 = coeffs[1], b2 = coeffs[2]
-    let a1 = coeffs[3], a2 = coeffs[4]
-    var z1 = state[0], z2 = state[1]
+    let b0 = coeffs[0]
+    let b1 = coeffs[1]
+    let b2 = coeffs[2]
+    let a1 = coeffs[3]
+    let a2 = coeffs[4]
+    var z1 = state[0]
+    var z2 = state[1]
 
     for i in 0..<count {
         let x = buffer[i]
@@ -1327,22 +2487,23 @@ private func processBiquad(
 }
 
 /// Apply 10-band parametric EQ (cascade of biquad sections)
-private func applyEQ(
+nonisolated private func applyEQ(
     _ buffer: UnsafeMutablePointer<Float>,
     count: Int,
     coeffs: UnsafePointer<Float>,
     state: UnsafeMutablePointer<Float>
 ) {
     for band in 0..<AudioConfig.eqBandCount {
-        processBiquad(buffer, count: count,
-                     coeffs: coeffs + band * 5,
-                     state: state + band * 2)
+        processBiquad(
+            buffer, count: count,
+            coeffs: coeffs + band * 5,
+            state: state + band * 2)
     }
 }
 
 /// Soft limiter: transparent below threshold, tanh compression above
 /// Approaches but never reaches ±1.0
-private func applySoftLimiter(_ buffer: UnsafeMutablePointer<Float>, count: Int) {
+nonisolated private func applySoftLimiter(_ buffer: UnsafeMutablePointer<Float>, count: Int) {
     // Fast path: skip if no samples exceed threshold
     var maxVal: Float = 0
     vDSP_maxmgv(buffer, 1, &maxVal, vDSP_Length(count))
@@ -1364,7 +2525,7 @@ private func applySoftLimiter(_ buffer: UnsafeMutablePointer<Float>, count: Int)
 
 /// Catmull-Rom cubic resample srcCount samples → dstCount samples
 /// Much higher quality than linear interpolation — preserves high-frequency detail
-private func cubicResample(
+nonisolated private func cubicResample(
     src: UnsafePointer<Float>, srcCount: Int,
     dst: UnsafeMutablePointer<Float>, dstCount: Int
 ) {
@@ -1390,9 +2551,9 @@ private func cubicResample(
         let p3 = src[min(idx + 2, srcCount - 1)]
 
         let a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
-        let b =       p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3
-        let c = -0.5 * p0            + 0.5 * p2
-        let d =                  p1
+        let b = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3
+        let c = -0.5 * p0 + 0.5 * p2
+        let d = p1
 
         dst[i] = ((a * frac + b) * frac + c) * frac + d
     }
@@ -1400,7 +2561,7 @@ private func cubicResample(
 
 // MARK: - Input Render Callback
 
-private func inputRenderCallback(
+nonisolated private func inputRenderCallback(
     inRefCon: UnsafeMutableRawPointer,
     ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
     inTimeStamp: UnsafePointer<AudioTimeStamp>,
@@ -1409,11 +2570,27 @@ private func inputRenderCallback(
     ioData: UnsafeMutablePointer<AudioBufferList>?
 ) -> OSStatus {
 
-    let state = Unmanaged<SharedAudioState>.fromOpaque(inRefCon).takeUnretainedValue()
+    let context =
+        Unmanaged<AudioCallbackContext>
+        .fromOpaque(inRefCon)
+        .takeUnretainedValue()
+    guard let state = context.begin() else { return noErr }
+    defer { context.end() }
     guard let unit = state.inputUnit else { return noErr }
+    let callbackStart = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+    defer {
+        let callbackEnd = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)
+        state.recordCallbackDuration(
+            nanoseconds: callbackEnd &- callbackStart
+        )
+    }
 
     let channelCount = state.channelCount
     let frameCount = Int(inNumberFrames)
+    guard frameCount <= state.inputCapacity else {
+        state.recordInputOverflow()
+        return kAudio_ParamError
+    }
     let byteSize = inNumberFrames * UInt32(MemoryLayout<Float>.stride)
     let leftBuf = state.workLeft
     let rightBuf = state.workRight
@@ -1423,26 +2600,49 @@ private func inputRenderCallback(
         var stereoABL: (AudioBufferList, AudioBuffer) = (
             AudioBufferList(
                 mNumberBuffers: 2,
-                mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: byteSize,
-                                      mData: UnsafeMutableRawPointer(leftBuf))
+                mBuffers: AudioBuffer(
+                    mNumberChannels: 1, mDataByteSize: byteSize,
+                    mData: UnsafeMutableRawPointer(leftBuf))
             ),
-            AudioBuffer(mNumberChannels: 1, mDataByteSize: byteSize,
-                        mData: UnsafeMutableRawPointer(rightBuf))
+            AudioBuffer(
+                mNumberChannels: 1, mDataByteSize: byteSize,
+                mData: UnsafeMutableRawPointer(rightBuf))
         )
         var renderStatus: OSStatus = noErr
         withUnsafeMutablePointer(to: &stereoABL) { ptr in
             let ablPtr = UnsafeMutableRawPointer(ptr).assumingMemoryBound(to: AudioBufferList.self)
-            renderStatus = AudioUnitRender(unit, ioActionFlags, inTimeStamp, 1, inNumberFrames, ablPtr)
+            renderStatus = state.audioUnitRuntime.render(
+                unit,
+                actionFlags: ioActionFlags,
+                timestamp: inTimeStamp,
+                bus: 1,
+                frameCount: inNumberFrames,
+                data: ablPtr
+            )
         }
-        guard renderStatus == noErr else { return renderStatus }
+        guard renderStatus == noErr else {
+            state.recordRenderFailure(renderStatus)
+            return renderStatus
+        }
     } else {
         var bufferList = AudioBufferList(
             mNumberBuffers: 1,
-            mBuffers: AudioBuffer(mNumberChannels: 1, mDataByteSize: byteSize,
-                                  mData: UnsafeMutableRawPointer(leftBuf))
+            mBuffers: AudioBuffer(
+                mNumberChannels: 1, mDataByteSize: byteSize,
+                mData: UnsafeMutableRawPointer(leftBuf))
         )
-        let status = AudioUnitRender(unit, ioActionFlags, inTimeStamp, 1, inNumberFrames, &bufferList)
-        guard status == noErr else { return status }
+        let status = state.audioUnitRuntime.render(
+            unit,
+            actionFlags: ioActionFlags,
+            timestamp: inTimeStamp,
+            bus: 1,
+            frameCount: inNumberFrames,
+            data: &bufferList
+        )
+        guard status == noErr else {
+            state.recordRenderFailure(status)
+            return status
+        }
         memcpy(rightBuf, leftBuf, frameCount * MemoryLayout<Float>.stride)
     }
 
@@ -1454,22 +2654,32 @@ private func inputRenderCallback(
     let eqActive = state.cachedEqActive
     let gainActive = params.gain != 1.0
 
-    // Clean passthrough when no processing is engaged (Audacity-style transparent wire).
-    // DC filter + limiter only run when EQ is active, since EQ boosts can cause DC
-    // offset and clipping. Without EQ, the signal passes through bit-perfect.
+    // Clean passthrough when no processing is engaged (Audacity-style transparent
+    // wire). The DC filter is only needed for EQ, while the limiter protects any
+    // boosted path (EQ and/or gain).
     if eqActive {
         // DC offset removal — first-order high-pass (~20 Hz)
         // Only needed when EQ is active (boosted bands can amplify DC from preamp)
-        let R = state.dcFilterR
-        var lpx = state.dcLeftPrevX, lpy = state.dcLeftPrevY
-        var rpx = state.dcRightPrevX, rpy = state.dcRightPrevY
+        let filterCoefficient = state.dcFilterR
+        var lpx = state.dcLeftPrevX
+        var lpy = state.dcLeftPrevY
+        var rpx = state.dcRightPrevX
+        var rpy = state.dcRightPrevY
 
         for i in 0..<frameCount {
-            let lx = leftBuf[i]; lpy = lx - lpx + R * lpy; lpx = lx; leftBuf[i] = lpy
-            let rx = rightBuf[i]; rpy = rx - rpx + R * rpy; rpx = rx; rightBuf[i] = rpy
+            let lx = leftBuf[i]
+            lpy = lx - lpx + filterCoefficient * lpy
+            lpx = lx
+            leftBuf[i] = lpy
+            let rx = rightBuf[i]
+            rpy = rx - rpx + filterCoefficient * rpy
+            rpx = rx
+            rightBuf[i] = rpy
         }
-        state.dcLeftPrevX = lpx; state.dcLeftPrevY = lpy
-        state.dcRightPrevX = rpx; state.dcRightPrevY = rpy
+        state.dcLeftPrevX = lpx
+        state.dcLeftPrevY = lpy
+        state.dcRightPrevX = rpx
+        state.dcRightPrevY = rpy
     }
 
     // Apply gain
@@ -1484,50 +2694,42 @@ private func inputRenderCallback(
         applyEQ(leftBuf, count: frameCount, coeffs: state.eqCoeffs, state: state.eqStateL)
         applyEQ(rightBuf, count: frameCount, coeffs: state.eqCoeffs, state: state.eqStateR)
 
-        // Soft limiter — only needed when EQ is active (boosts can clip)
+        // Soft limiter — EQ boosts can clip even at unity gain.
+        applySoftLimiter(leftBuf, count: frameCount)
+        applySoftLimiter(rightBuf, count: frameCount)
+    } else if params.gain > 1 {
+        // Gain is applied once above; protect every boosted path, including
+        // headless recording/streaming with a flat EQ.
         applySoftLimiter(leftBuf, count: frameCount)
         applySoftLimiter(rightBuf, count: frameCount)
     }
 
     // Metering — average RMS of both channels
     if params.meteringEnabled {
-        var leftRms: Float = 0, rightRms: Float = 0
+        var leftRms: Float = 0
+        var rightRms: Float = 0
         vDSP_rmsqv(leftBuf, 1, &leftRms, vDSP_Length(frameCount))
         vDSP_rmsqv(rightBuf, 1, &rightRms, vDSP_Length(frameCount))
-        state.updatePeak(rms: (leftRms + rightRms) * 0.5, gain: params.gain)
+        // Peak-based control must not add 6 dB simply because only one input
+        // of a stereo interface carries signal.
+        state.updatePeak(rms: max(leftRms, rightRms), gain: 1)
     }
 
-    // Write to ring buffers (atomic stereo write)
-    state.writeStereo(left: leftBuf, right: rightBuf, count: frameCount)
-
-    // Interleave L/R for streaming and recording
-    let needsInterleaved = state.streamServerPtr != nil || state.recorderPtr != nil
-    if needsInterleaved {
-        let interleavedBuf = state.workInterleaved
-        for i in 0..<frameCount {
-            interleavedBuf[i * 2] = leftBuf[i]
-            interleavedBuf[i * 2 + 1] = rightBuf[i]
-        }
-
-        // Broadcast to stream clients
-        if let serverPtr = state.streamServerPtr {
-            let server = Unmanaged<AudioStreamServer>.fromOpaque(serverPtr).takeUnretainedValue()
-            server.broadcast(interleavedBuf, frameCount: frameCount)
-        }
-
-        // Write to recorder
-        if let recorderPtr = state.recorderPtr {
-            let recorder = Unmanaged<AudioRecorder>.fromOpaque(recorderPtr).takeUnretainedValue()
-            recorder.write(interleavedBuf, frameCount: frameCount)
-        }
-    }
+    // One allocation-free fanout into independent bounded rings for playback,
+    // native visualization, continuous analysis, and recording/network work.
+    state.writeStereo(
+        left: leftBuf,
+        right: rightBuf,
+        count: frameCount,
+        captureTimestampNanoseconds: callbackStart
+    )
 
     return noErr
 }
 
 // MARK: - Output Render Callback
 
-private func outputRenderCallback(
+nonisolated private func outputRenderCallback(
     inRefCon: UnsafeMutableRawPointer,
     ioActionFlags: UnsafeMutablePointer<AudioUnitRenderActionFlags>,
     inTimeStamp: UnsafePointer<AudioTimeStamp>,
@@ -1536,15 +2738,38 @@ private func outputRenderCallback(
     ioData: UnsafeMutablePointer<AudioBufferList>?
 ) -> OSStatus {
 
-    let state = Unmanaged<SharedAudioState>.fromOpaque(inRefCon).takeUnretainedValue()
+    let context =
+        Unmanaged<AudioCallbackContext>
+        .fromOpaque(inRefCon)
+        .takeUnretainedValue()
+    guard let state = context.begin() else {
+        if let ioData {
+            for buffer in UnsafeMutableAudioBufferListPointer(ioData) {
+                if let data = buffer.mData {
+                    memset(data, 0, Int(buffer.mDataByteSize))
+                }
+            }
+        }
+        return noErr
+    }
+    defer { context.end() }
     guard let bufferListPtr = ioData else { return noErr }
 
     let frameCount = Int(inNumberFrames)
     let bufferList = UnsafeMutableAudioBufferListPointer(bufferListPtr)
 
     guard bufferList.count >= 1,
-          let ch0 = bufferList[0].mData?.assumingMemoryBound(to: Float.self) else {
+        let ch0 = bufferList[0].mData?.assumingMemoryBound(to: Float.self)
+    else {
         return noErr
+    }
+    guard frameCount + 1 <= state.outputCapacity else {
+        for buffer in bufferList {
+            if let data = buffer.mData {
+                memset(data, 0, Int(buffer.mDataByteSize))
+            }
+        }
+        return kAudio_ParamError
     }
 
     let volume = state.getParams().volume
@@ -1609,9 +2834,11 @@ private func outputRenderCallback(
     }
 
     // Silence extra channels
-    for i in 2..<bufferList.count {
-        if let chData = bufferList[i].mData {
-            memset(chData, 0, Int(bufferList[i].mDataByteSize))
+    if bufferList.count > 2 {
+        for i in 2..<bufferList.count {
+            if let chData = bufferList[i].mData {
+                memset(chData, 0, Int(bufferList[i].mDataByteSize))
+            }
         }
     }
 

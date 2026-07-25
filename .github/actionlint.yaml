@@ -1,0 +1,8 @@
+self-hosted-runner:
+  labels:
+    - focusrite
+    - performance
+
+config-variables: null
+
+paths: {}

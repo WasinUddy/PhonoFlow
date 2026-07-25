@@ -1,0 +1,152 @@
+name: Focusrite Hardware Acceptance
+
+on:
+  schedule:
+    - cron: "41 18 * * *"
+  workflow_dispatch:
+    inputs:
+      soak_minutes:
+        description: Hardware soak duration
+        required: true
+        default: "30"
+        type: choice
+        options:
+          - "10"
+          - "30"
+          - "60"
+
+concurrency:
+  group: focusrite-hardware
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.4.app/Contents/Developer
+  PHONOFLOW_XCODE_VERSION: "26.4"
+
+jobs:
+  focusrite:
+    name: Scarlett soak
+    if: >-
+      vars.PHONOFLOW_FOCUSRITE_RUNNER_ENABLED == 'true' &&
+      github.ref == 'refs/heads/main'
+    environment: hardware-acceptance
+    runs-on:
+      - self-hosted
+      - macOS
+      - focusrite
+    timeout-minutes: 90
+    env:
+      PHONOFLOW_FOCUSRITE_REQUIRED: "1"
+      PHONOFLOW_FOCUSRITE_SOAK_MINUTES: ${{ inputs.soak_minutes || '30' }}
+
+    steps:
+      - name: Check out trusted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          clean: true
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Verify hardware test contract
+        run: Scripts/ci/preflight.sh focusrite
+
+      - name: Resolve locked Xcode packages
+        run: Scripts/ci/resolve-xcode-packages.sh "${RUNNER_TEMP}/SourcePackages-focusrite"
+
+      - name: Require attached Focusrite device
+        run: |
+          system_profiler SPAudioDataType \
+            > "${RUNNER_TEMP}/focusrite-system-profiler.txt"
+          if ! grep -Eiq \
+            'Focusrite|Scarlett' \
+            "${RUNNER_TEMP}/focusrite-system-profiler.txt"; then
+            echo "No Focusrite/Scarlett CoreAudio device is attached to this runner." >&2
+            exit 1
+          fi
+
+      - name: Run hardware acceptance and soak
+        run: |
+          case "$PHONOFLOW_FOCUSRITE_SOAK_MINUTES" in
+            10|30|60) ;;
+            *)
+              echo "soak_minutes must be one of 10, 30, or 60." >&2
+              exit 2
+              ;;
+          esac
+          hardware_result_path="${HOME}/Library/Containers/com.wasinuddy.PhonoFlow/Data/Library/Application Support/PhonoFlow Hardware Acceptance/focusrite-metrics.json"
+          rm -f "$hardware_result_path"
+          export TEST_RUNNER_PHONOFLOW_FOCUSRITE_REQUIRED=1
+          export TEST_RUNNER_PHONOFLOW_FOCUSRITE_SOAK_SECONDS="$((PHONOFLOW_FOCUSRITE_SOAK_MINUTES * 60))"
+          export TEST_RUNNER_PHONOFLOW_HARDWARE_RESULT_PATH="$hardware_result_path"
+          export TEST_RUNNER_PHONOFLOW_STATE_DIR="${RUNNER_TEMP}/phonoflow-focusrite-state"
+          mkdir -p "$TEST_RUNNER_PHONOFLOW_STATE_DIR"
+          xcodebuild test \
+            -project PhonoFlow.xcodeproj \
+            -scheme PhonoFlow \
+            -testPlan PhonoFlow-Focusrite \
+            -configuration Release \
+            -destination "platform=macOS" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData-focusrite" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages-focusrite" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            -resultBundlePath "${RUNNER_TEMP}/PhonoFlow-Focusrite.xcresult" \
+            ENABLE_TESTABILITY=YES \
+            COMPILER_INDEX_STORE_ENABLE=NO
+          cp "$hardware_result_path" "${RUNNER_TEMP}/focusrite-metrics.json"
+
+      - name: Require hardware metrics
+        run: |
+          hardware_result_path="${RUNNER_TEMP}/focusrite-metrics.json"
+          expected_seconds="$((PHONOFLOW_FOCUSRITE_SOAK_MINUTES * 60))"
+          python3 -m json.tool "$hardware_result_path" >/dev/null
+          python3 - "$hardware_result_path" "$expected_seconds" <<'PY'
+          import json
+          import sys
+
+          result = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected_seconds = int(sys.argv[2])
+          required = {
+              "xrunCount": 0,
+              "ringOverflowCount": 0,
+              "sustainedMemoryGrowth": False,
+          }
+          failures = [
+              f"{key}={result.get(key)!r}, expected {expected!r}"
+              for key, expected in required.items()
+              if result.get(key) != expected
+          ]
+          if result.get("inputChannelCount", 0) < 2:
+              failures.append("inputChannelCount is less than two")
+          if not result.get("deviceName") or not result.get("deviceUID"):
+              failures.append("device identity is missing")
+          if result.get("sampleRate", 0) <= 0 or result.get("bufferFrames", 0) <= 0:
+              failures.append("negotiated sample rate or buffer size is invalid")
+          if result.get("durationSeconds", 0) < expected_seconds - 5:
+              failures.append("the soak ended before its requested duration")
+          if result.get("queueCapacity", 0) <= 0:
+              failures.append("queueCapacity is missing or invalid")
+          if result.get("maximumQueueDepth", 1) > result.get("queueCapacity", 0):
+              failures.append("maximumQueueDepth exceeded queueCapacity")
+          if failures:
+              raise SystemExit("; ".join(failures))
+          PY
+
+      - name: Upload hardware results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: focusrite-hardware-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/PhonoFlow-Focusrite.xcresult
+            ${{ runner.temp }}/focusrite-metrics.json
+            ${{ runner.temp }}/focusrite-system-profiler.txt
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 30

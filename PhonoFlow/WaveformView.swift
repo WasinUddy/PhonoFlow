@@ -9,9 +9,15 @@ import SwiftUI
 
 private enum MeterLayout {
     static let segmentCount = 48
-    static let gap: CGFloat         = 1.5
+    static let gap: CGFloat = 1.5
     static let cornerRadius: CGFloat = 1.5
-    static let height: CGFloat      = 10
+    static let height: CGFloat = 10
+    static let channelLabelWidth: CGFloat = 10
+    static let channelSpacing: CGFloat = 4
+
+    static var meterLeadingInset: CGFloat {
+        channelLabelWidth + channelSpacing
+    }
 }
 
 struct WaveformView: View {
@@ -20,11 +26,23 @@ struct WaveformView: View {
     @Binding var gain: Float
     @Binding var isAutoGainEnabled: Bool
     var theme: ColorTheme = .midnight
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
-    private var dimColor: Color { .primary.opacity(0.3) }
-    private var subtleColor: Color { .primary.opacity(0.35) }
-    private var midColor: Color { .primary.opacity(0.45) }
-    private var unlitColor: Color { .primary.opacity(0.06) }
+    private var dimColor: Color {
+        .primary.opacity(colorSchemeContrast == .increased ? 0.9 : 0.64)
+    }
+
+    private var subtleColor: Color {
+        .primary.opacity(colorSchemeContrast == .increased ? 0.92 : 0.7)
+    }
+
+    private var midColor: Color {
+        .primary.opacity(colorSchemeContrast == .increased ? 1 : 0.78)
+    }
+
+    private var unlitColor: Color {
+        .primary.opacity(colorSchemeContrast == .increased ? 0.2 : 0.1)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -52,16 +70,26 @@ struct WaveformView: View {
 
     private func levelToMeterFraction(_ level: Float) -> Float {
         guard level > 0.00001 else { return 0 }
-        let db = 20 * log10(level)
-        return max(0, min(1, (db - Self.meterMinDB) / (Self.meterMaxDB - Self.meterMinDB)))
+        return decibelsToMeterFraction(20 * log10(level))
+    }
+
+    private func decibelsToMeterFraction(_ decibels: Float) -> Float {
+        max(
+            0,
+            min(
+                1,
+                (decibels - Self.meterMinDB) / (Self.meterMaxDB - Self.meterMinDB)
+            )
+        )
     }
 
     private func channelMeter(level: Float, label: String) -> some View {
-        HStack(spacing: 4) {
+        HStack(spacing: MeterLayout.channelSpacing) {
             Text(label)
-                .font(.system(size: 8, weight: .semibold, design: .monospaced))
+                .font(.caption2.monospaced().weight(.semibold))
                 .foregroundStyle(dimColor)
-                .frame(width: 10)
+                .frame(width: MeterLayout.channelLabelWidth)
+                .accessibilityHidden(true)
 
             GeometryReader { geo in
                 let count = MeterLayout.segmentCount
@@ -80,28 +108,51 @@ struct WaveformView: View {
                         context.fill(path, with: .color(segmentColor(at: fraction, lit: lit)))
                     }
                 }
+                .accessibilityHidden(true)
             }
             .frame(height: MeterLayout.height)
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label == "L" ? "Left channel level" : "Right channel level")
+        .accessibilityValue(levelAccessibilityValue(level))
     }
 
     private var meterScale: some View {
-        HStack {
-            Spacer().frame(width: 14)
-            Text("-\u{221E}")
-            Spacer()
-            Text("-30")
-            Spacer()
-            Text("-20")
-            Spacer()
-            Text("-10")
-            Spacer()
-            Text("-3")
-            Spacer()
-            Text("0 dB")
+        GeometryReader { geometry in
+            let meterWidth = max(geometry.size.width - MeterLayout.meterLeadingInset, 0)
+
+            Canvas { context, _ in
+                let ticks: [(label: String, decibels: Float)] = [
+                    ("-\u{221E}", Self.meterMinDB),
+                    ("-30", -30),
+                    ("-20", -20),
+                    ("-10", -10),
+                    ("-3", -3),
+                    ("0 dB", Self.meterMaxDB),
+                ]
+
+                for tick in ticks {
+                    let fraction = CGFloat(decibelsToMeterFraction(tick.decibels))
+                    let x = MeterLayout.meterLeadingInset + meterWidth * fraction
+                    let anchor: UnitPoint =
+                        if fraction == 0 {
+                            .topLeading
+                        } else if fraction == 1 {
+                            .topTrailing
+                        } else {
+                            .top
+                        }
+                    let label = context.resolve(
+                        Text(tick.label)
+                            .font(.caption2.monospaced().weight(.medium))
+                            .foregroundStyle(dimColor)
+                    )
+                    context.draw(label, at: CGPoint(x: x, y: 0), anchor: anchor)
+                }
+            }
         }
-        .font(.system(size: 7, weight: .medium, design: .monospaced))
-        .foregroundStyle(dimColor)
+        .frame(height: 14)
+        .accessibilityHidden(true)
     }
 
     // MARK: - Gain Slider
@@ -111,15 +162,24 @@ struct WaveformView: View {
             Image(systemName: "speaker.wave.1")
                 .font(.system(size: 9))
                 .foregroundStyle(subtleColor)
+                .accessibilityHidden(true)
 
             Slider(value: $gain, in: 0...4, step: 0.05)
                 .tint(theme.sliderTint)
                 .disabled(isAutoGainEnabled)
+                .accessibilityLabel("Input gain")
+                .accessibilityValue(gainLabel)
+                .accessibilityHint(
+                    isAutoGainEnabled
+                        ? "Automatic gain is enabled. Disable it to adjust input gain manually."
+                        : "Adjusts the input gain from silence to twelve decibels."
+                )
 
             Text(gainLabel)
-                .font(.system(size: 9, weight: .medium, design: .monospaced))
+                .font(.caption2.monospaced().weight(.medium))
                 .foregroundStyle(midColor)
                 .frame(width: 50, alignment: .trailing)
+                .accessibilityHidden(true)
 
             autoGainButton
         }
@@ -135,6 +195,9 @@ struct WaveformView: View {
         }
         .buttonStyle(.plain)
         .help(isAutoGainEnabled ? "Disable Auto-Gain" : "Enable Auto-Gain (normalizes to -6dB)")
+        .accessibilityLabel(isAutoGainEnabled ? "Disable automatic gain" : "Enable automatic gain")
+        .accessibilityValue(isAutoGainEnabled ? "On" : "Off")
+        .accessibilityHint("Automatic gain targets minus six decibels.")
     }
 
     private var gainLabel: String {
@@ -148,8 +211,17 @@ struct WaveformView: View {
 
     private func segmentColor(at fraction: Float, lit: Bool) -> Color {
         if !lit { return unlitColor }
-        if fraction > MeterThresholds.peak    { return AppColors.meterPeakRed }
+        if fraction > MeterThresholds.peak { return AppColors.meterPeakRed }
         if fraction > MeterThresholds.warning { return AppColors.meterWarningYellow }
         return theme.meterGreen
+    }
+
+    private func levelAccessibilityValue(_ level: Float) -> String {
+        guard level > 0.000_01 else { return "Silent" }
+        let decibels = max(20 * log10(level), -80)
+        if level >= 0.99 {
+            return String(format: "%.1f decibels, clipping", decibels)
+        }
+        return String(format: "%.1f decibels", decibels)
     }
 }

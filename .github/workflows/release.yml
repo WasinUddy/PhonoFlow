@@ -1,0 +1,365 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  release:
+    name: Sign, notarize, and publish
+    runs-on: macos-26
+    environment: release
+    timeout-minutes: 90
+    permissions:
+      attestations: write
+      checks: read
+      contents: write
+      id-token: write
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.4.app/Contents/Developer
+      PHONOFLOW_XCODE_VERSION: "26.4"
+      APPLE_TEAM_ID: ${{ vars.APPLE_TEAM_ID }}
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Validate protected release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          resolve_remote_tag_commit() {
+            local object_data object_sha object_type
+            local depth=0
+
+            object_data="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )"
+            IFS=$'\t' read -r object_type object_sha <<< "$object_data"
+
+            while [[ "$object_type" == "tag" ]]; do
+              ((depth += 1))
+              if [[ "$depth" -gt 8 ]]; then
+                echo "The release tag has an unexpectedly deep annotated-tag chain." >&2
+                return 1
+              fi
+              object_data="$(
+                gh api \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )"
+              IFS=$'\t' read -r object_type object_sha <<< "$object_data"
+            done
+
+            if [[ "$object_type" != "commit" || ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "The remote release tag does not resolve to one commit." >&2
+              return 1
+            fi
+            printf '%s\n' "$object_sha"
+          }
+
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "Release tags must use stable SemVer (vMAJOR.MINOR.PATCH)." >&2
+            exit 1
+          fi
+          if [[ -z "$RELEASE_ADMIN_READ_TOKEN" ]]; then
+            echo "The release environment secret RELEASE_ADMIN_READ_TOKEN is not configured." >&2
+            exit 1
+          fi
+          if [[ "$(
+            GH_TOKEN="$RELEASE_ADMIN_READ_TOKEN" gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+              --jq '.enabled'
+          )" != "true" ]]; then
+            echo "GitHub immutable releases must be enabled before release work begins." >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME#v}"
+          if [[ "$(git rev-parse HEAD)" != "$GITHUB_SHA" ]]; then
+            echo "The checked-out commit does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse "${GITHUB_REF_NAME}^{commit}")" != "$GITHUB_SHA" ]]; then
+            echo "The checked-out commit does not match the release tag." >&2
+            exit 1
+          fi
+          if [[ "$(resolve_remote_tag_commit)" != "$GITHUB_SHA" ]]; then
+            echo "The remote release tag does not match GITHUB_SHA." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "The release commit is not reachable from origin/main." >&2
+            exit 1
+          fi
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "A GitHub Release already exists for $GITHUB_REF_NAME." >&2
+            exit 1
+          fi
+          published_tags_path="${RUNNER_TEMP}/published-release-tags.txt"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --paginate \
+            "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name' \
+            > "$published_tags_path"
+          if ! python3 - "$version" "$published_tags_path" <<'PY'
+          import re
+          import sys
+
+          candidate = tuple(map(int, sys.argv[1].split(".")))
+          stable = []
+          for line in open(sys.argv[2], encoding="utf-8"):
+              match = re.fullmatch(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", line.strip())
+              if match:
+                  stable.append(tuple(map(int, match.groups())))
+          if stable and candidate <= max(stable):
+              raise SystemExit(
+                  f"Release {candidate!r} is not newer than the published stable version {max(stable)!r}."
+              )
+          PY
+          then
+            exit 1
+          fi
+          if [[ -z "$APPLE_TEAM_ID" ]]; then
+            echo "The release environment variable APPLE_TEAM_ID is not configured." >&2
+            exit 1
+          fi
+
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+
+      - name: Validate release inputs and resolve locked packages
+        run: Scripts/ci/preflight.sh release
+
+      - name: Import Developer ID certificate
+        env:
+          APPLE_DEVELOPER_ID_P12_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_P12_BASE64 }}
+          APPLE_DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+        run: Scripts/ci/import-signing-certificate.sh
+
+      - name: Create signed universal artifacts
+        id: signed
+        run: Scripts/ci/release-artifacts.sh
+
+      - name: Notarize and finalize artifacts
+        id: artifacts
+        env:
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_KEY_P8_BASE64: ${{ secrets.APPLE_NOTARY_KEY_P8_BASE64 }}
+          SIGNED_DMG_PATH: ${{ steps.signed.outputs.signed_dmg }}
+          DSYM_SOURCE_PATH: ${{ steps.signed.outputs.dsym_source }}
+        run: Scripts/ci/notarize-release.sh "$SIGNED_DMG_PATH" "$DSYM_SOURCE_PATH"
+
+      - name: Attest release artifacts
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4.2.0
+        with:
+          subject-path: |
+            ${{ steps.artifacts.outputs.dmg }}
+            ${{ steps.artifacts.outputs.dsym }}
+            ${{ steps.artifacts.outputs.checksums }}
+
+      - name: Upload release workflow artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: PhonoFlow-${{ github.ref_name }}-release
+          path: |
+            ${{ steps.artifacts.outputs.dmg }}
+            ${{ steps.artifacts.outputs.dsym }}
+            ${{ steps.artifacts.outputs.checksums }}
+          if-no-files-found: error
+          compression-level: 0
+          overwrite: true
+          retention-days: 90
+
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG_PATH: ${{ steps.artifacts.outputs.dmg }}
+          DSYM_PATH: ${{ steps.artifacts.outputs.dsym }}
+          CHECKSUMS_PATH: ${{ steps.artifacts.outputs.checksums }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "$DMG_PATH" \
+            "$DSYM_PATH" \
+            "$CHECKSUMS_PATH" \
+            --verify-tag \
+            --generate-notes \
+            --title "PhonoFlow ${VERSION}" \
+            --draft
+
+      - name: Gate and publish immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_ADMIN_READ_TOKEN: ${{ secrets.RELEASE_ADMIN_READ_TOKEN }}
+        run: |
+          check_runs_path="${RUNNER_TEMP}/release-check-runs.json"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --paginate \
+            --slurp \
+            "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/check-runs?per_page=100&filter=latest" \
+            > "$check_runs_path"
+          python3 - "$check_runs_path" "$GITHUB_SHA" <<'PY'
+          import json
+          import sys
+          from datetime import datetime
+
+          required = {
+              "Native (ARM64)",
+              "Native (Intel)",
+              "WebUI",
+              "Fake Scarlett",
+              "Native WebUI (chromium)",
+              "Native WebUI (webkit)",
+          }
+          pages = json.load(open(sys.argv[1], encoding="utf-8"))
+          expected_sha = sys.argv[2]
+          latest = {name: [] for name in required}
+          for page in pages:
+              for run in page.get("check_runs", []):
+                  if (
+                      run.get("name") not in required
+                      or run.get("head_sha") != expected_sha
+                      or run.get("app", {}).get("slug") != "github-actions"
+                  ):
+                      continue
+                  latest[run["name"]].append(run)
+
+          def started_at(run):
+              value = run.get("started_at")
+              if not isinstance(value, str):
+                  raise SystemExit(
+                      f"Required check {run.get('name')!r} has no started_at timestamp"
+                  )
+              try:
+                  return datetime.fromisoformat(value.replace("Z", "+00:00"))
+              except ValueError as error:
+                  raise SystemExit(
+                      f"Required check {run.get('name')!r} has invalid started_at: {value!r}"
+                  ) from error
+
+          failures = []
+          for name in sorted(required):
+              runs = latest[name]
+              if not runs:
+                  failures.append(f"{name}: missing")
+                  continue
+              run = max(
+                  runs,
+                  key=lambda item: (started_at(item), int(item.get("id", -1))),
+              )
+              if run.get("status") != "completed":
+                  failures.append(f"{name}: {run.get('status', 'unknown')}")
+              elif run.get("conclusion") != "success":
+                  failures.append(f"{name}: {run.get('conclusion', 'unknown')}")
+          if failures:
+              raise SystemExit(
+                  "Release commit has incomplete required checks: " + ", ".join(failures)
+              )
+          PY
+
+          resolve_remote_tag_commit() {
+            local object_data object_sha object_type
+            local depth=0
+
+            object_data="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+                --jq '.object | [.type, .sha] | @tsv'
+            )"
+            IFS=$'\t' read -r object_type object_sha <<< "$object_data"
+
+            while [[ "$object_type" == "tag" ]]; do
+              ((depth += 1))
+              if [[ "$depth" -gt 8 ]]; then
+                echo "The release tag has an unexpectedly deep annotated-tag chain." >&2
+                return 1
+              fi
+              object_data="$(
+                gh api \
+                  -H "Accept: application/vnd.github+json" \
+                  -H "X-GitHub-Api-Version: 2022-11-28" \
+                  "repos/${GITHUB_REPOSITORY}/git/tags/${object_sha}" \
+                  --jq '.object | [.type, .sha] | @tsv'
+              )"
+              IFS=$'\t' read -r object_type object_sha <<< "$object_data"
+            done
+
+            if [[ "$object_type" != "commit" || ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+              echo "The remote release tag does not resolve to one commit." >&2
+              return 1
+            fi
+            printf '%s\n' "$object_sha"
+          }
+
+          if [[ "$(resolve_remote_tag_commit)" != "$GITHUB_SHA" ]]; then
+            echo "The remote release tag moved after this workflow started." >&2
+            exit 1
+          fi
+          if [[ "$(
+            GH_TOKEN="$RELEASE_ADMIN_READ_TOKEN" gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "repos/${GITHUB_REPOSITORY}/immutable-releases" \
+              --jq '.enabled'
+          )" != "true" ]]; then
+            echo "GitHub immutable releases were disabled before publication." >&2
+            exit 1
+          fi
+
+          gh release edit "$GITHUB_REF_NAME" \
+            --verify-tag \
+            --draft=false \
+            --latest
+
+      - name: Verify attestations and published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DMG_PATH: ${{ steps.artifacts.outputs.dmg }}
+          DSYM_PATH: ${{ steps.artifacts.outputs.dsym }}
+          CHECKSUMS_PATH: ${{ steps.artifacts.outputs.checksums }}
+        run: |
+          attestation_policy=(
+            --repo "$GITHUB_REPOSITORY"
+            --signer-workflow "github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+            --source-ref "$GITHUB_REF"
+            --source-digest "$GITHUB_SHA"
+          )
+          gh attestation verify "$DMG_PATH" "${attestation_policy[@]}"
+          gh attestation verify "$DSYM_PATH" "${attestation_policy[@]}"
+          gh attestation verify "$CHECKSUMS_PATH" "${attestation_policy[@]}"
+          gh release verify "$GITHUB_REF_NAME"
+          gh release verify-asset "$GITHUB_REF_NAME" "$DMG_PATH"
+          gh release verify-asset "$GITHUB_REF_NAME" "$DSYM_PATH"
+          gh release verify-asset "$GITHUB_REF_NAME" "$CHECKSUMS_PATH"
+
+      - name: Remove signing credentials
+        if: always()
+        run: Scripts/ci/import-signing-certificate.sh --cleanup

@@ -12,6 +12,7 @@ struct AdvancedWaveformView: View {
     var rightWaveform: [Float]
     var theme: ColorTheme
     @State private var showInfo = false
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     var body: some View {
         VStack(spacing: 0) {
@@ -32,16 +33,21 @@ struct AdvancedWaveformView: View {
                         .fill(theme.accent)
                         .frame(width: 6, height: 6)
                     Text("L")
-                        .font(.system(size: 8, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.primary.opacity(0.45))
+                        .font(.caption2.monospaced().weight(.medium))
+                        .foregroundStyle(
+                            .primary.opacity(colorSchemeContrast == .increased ? 0.95 : 0.72)
+                        )
 
                     Circle()
                         .fill(theme.meterGreen)
                         .frame(width: 6, height: 6)
                     Text("R")
-                        .font(.system(size: 8, weight: .medium, design: .monospaced))
-                        .foregroundStyle(.primary.opacity(0.45))
+                        .font(.caption2.monospaced().weight(.medium))
+                        .foregroundStyle(
+                            .primary.opacity(colorSchemeContrast == .increased ? 0.95 : 0.72)
+                        )
                 }
+                .accessibilityHidden(true)
             }
             .padding(.bottom, 6)
 
@@ -50,7 +56,7 @@ struct AdvancedWaveformView: View {
                 let xStep = size.width / CGFloat(max(leftWaveform.count - 1, 1))
 
                 // Draw grid lines
-                context.opacity = 0.08
+                context.opacity = colorSchemeContrast == .increased ? 0.28 : 0.14
                 for i in [0.25, 0.5, 0.75] {
                     var line = Path()
                     let y = size.height * i
@@ -91,9 +97,36 @@ struct AdvancedWaveformView: View {
                     context.stroke(pathL, with: .color(theme.accent), lineWidth: 1.5)
                 }
             }
-            .frame(height: 100)
-            .background(Color.primary.opacity(0.03))
+            .frame(height: 112)
+            .background(
+                Color.primary.opacity(colorSchemeContrast == .increased ? 0.09 : 0.045)
+            )
             .cornerRadius(6)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Live stereo waveform")
+            .accessibilityValue(waveformAccessibilityValue)
+            .accessibilityIdentifier("visualization.waveform")
         }
+    }
+
+    private var waveformAccessibilityValue: String {
+        let leftPeak = leftWaveform.lazy.map { abs($0) }.max() ?? 0
+        let rightPeak = rightWaveform.lazy.map { abs($0) }.max() ?? 0
+
+        guard max(leftPeak, rightPeak) > 0.000_01 else {
+            return "No signal"
+        }
+
+        let leftValue = decibelLabel(leftPeak)
+        let rightValue = decibelLabel(rightPeak)
+        let clipping =
+            leftPeak >= 0.99 || rightPeak >= 0.99
+            ? ", clipping detected"
+            : ""
+        return "Left peak \(leftValue), right peak \(rightValue)\(clipping)"
+    }
+
+    private func decibelLabel(_ level: Float) -> String {
+        String(format: "%.1f decibels", max(20 * log10(max(level, 0.000_1)), -80))
     }
 }

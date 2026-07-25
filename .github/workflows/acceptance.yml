@@ -1,0 +1,344 @@
+name: Acceptance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: acceptance-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.4.app/Contents/Developer
+  PHONOFLOW_XCODE_VERSION: "26.4"
+  PHONOFLOW_ACCEPTANCE: "1"
+  PHONOFLOW_AUDIO_BACKEND: fake
+  PHONOFLOW_REMOTE_BIND_HOST: 127.0.0.1
+  PHONOFLOW_REMOTE_PORT: "17866"
+  PHONOFLOW_PAIRING_CODE: "123456"
+  PHONOFLOW_DISABLE_BONJOUR: "1"
+
+jobs:
+  web-gate:
+    name: WebUI coverage
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Enforce WebUI checks and coverage thresholds
+        env:
+          COVERAGE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          WEBUI_REQUIRE_CHANGED_COVERAGE: "1"
+        run: |
+          if [[ -z "$COVERAGE_BASE_SHA" ]] || [[ "$COVERAGE_BASE_SHA" =~ ^0+$ ]]; then
+            if [[ "$GITHUB_REF_TYPE" == "branch" && "$GITHUB_REF_NAME" != "main" ]]; then
+              COVERAGE_BASE_SHA="$(git merge-base HEAD origin/main)"
+            else
+              COVERAGE_BASE_SHA="$(git rev-parse HEAD^)"
+            fi
+            export COVERAGE_BASE_SHA
+          fi
+          Scripts/ci/web.sh check
+
+  native:
+    name: Fake Scarlett
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Verify acceptance contract
+        env:
+          EXPECTED_ARCHITECTURE: arm64
+        run: Scripts/ci/preflight.sh acceptance
+
+      - name: Resolve locked Xcode packages
+        run: Scripts/ci/resolve-xcode-packages.sh "${RUNNER_TEMP}/SourcePackages-acceptance"
+
+      - name: Run native acceptance tests
+        run: |
+          export PHONOFLOW_STATE_DIR="${RUNNER_TEMP}/phonoflow-native-state"
+          mkdir -p "$PHONOFLOW_STATE_DIR"
+          xcodebuild test \
+            -project PhonoFlow.xcodeproj \
+            -scheme PhonoFlow \
+            -testPlan PhonoFlow-Acceptance \
+            -configuration Debug \
+            -destination "platform=macOS,arch=arm64" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData-acceptance" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages-acceptance" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            -resultBundlePath "${RUNNER_TEMP}/PhonoFlow-Acceptance.xcresult" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=- \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Upload native acceptance results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-native
+          path: ${{ runner.temp }}/PhonoFlow-Acceptance.xcresult
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  fixture-browser:
+    name: Fixture WebUI (${{ matrix.browser }})
+    needs: web-gate
+    runs-on: macos-26
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        browser:
+          - chromium
+          - webkit
+    env:
+      PHONOFLOW_E2E_EXTERNAL_SERVER: "0"
+      PHONOFLOW_WEBUI_PREPARED: "1"
+      PHONOFLOW_WEBUI_URL: http://127.0.0.1:4173
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Install locked browser dependencies
+        env:
+          PLAYWRIGHT_BROWSER: ${{ matrix.browser }}
+        run: |
+          cd WebUI
+          npm ci --ignore-scripts --no-audit --no-fund
+          node_modules/.bin/playwright install "$PLAYWRIGHT_BROWSER"
+
+      - name: Exercise fixture-backed SSE and meter flows
+        env:
+          PLAYWRIGHT_BROWSER: ${{ matrix.browser }}
+          PHONOFLOW_PLAYWRIGHT_AUTH_DIR: ${{ runner.temp }}/phonoflow-fixture-auth-${{ matrix.browser }}
+        run: Scripts/ci/web.sh acceptance "$PLAYWRIGHT_BROWSER"
+
+      - name: Upload fixture acceptance results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-web-fixture-${{ matrix.browser }}
+          path: |
+            **/playwright-report
+            **/test-results
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  browser:
+    name: Native WebUI (${{ matrix.browser }})
+    needs: web-gate
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        browser:
+          - chromium
+          - webkit
+    env:
+      NO_PROXY: 127.0.0.1,localhost
+      PHONOFLOW_E2E_EXTERNAL_SERVER: "1"
+      PHONOFLOW_WEBUI_URL: http://127.0.0.1:17866
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Verify acceptance contract
+        env:
+          EXPECTED_ARCHITECTURE: arm64
+        run: Scripts/ci/preflight.sh acceptance
+
+      - name: Resolve locked Xcode packages
+        run: Scripts/ci/resolve-xcode-packages.sh "${RUNNER_TEMP}/SourcePackages-web"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Prepare locked browser dependencies
+        env:
+          PLAYWRIGHT_BROWSER: ${{ matrix.browser }}
+        run: |
+          cd WebUI
+          npm ci --ignore-scripts --no-audit --no-fund
+          node_modules/.bin/playwright install "$PLAYWRIGHT_BROWSER"
+
+      - name: Build, launch, and test WebUI
+        env:
+          PLAYWRIGHT_BROWSER: ${{ matrix.browser }}
+          PHONOFLOW_PLAYWRIGHT_AUTH_DIR: ${{ runner.temp }}/phonoflow-native-auth-${{ matrix.browser }}
+          PHONOFLOW_WEBUI_PREPARED: "1"
+        run: |
+          export PHONOFLOW_STATE_DIR="${RUNNER_TEMP}/phonoflow-web-state-${PLAYWRIGHT_BROWSER}"
+          mkdir -p "$PHONOFLOW_STATE_DIR"
+          xcodebuild build \
+            -project PhonoFlow.xcodeproj \
+            -scheme PhonoFlow \
+            -configuration Debug \
+            -destination "platform=macOS,arch=arm64" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData-web" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages-web" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=- \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+          app_executable="${RUNNER_TEMP}/DerivedData-web/Build/Products/Debug/PhonoFlow.app/Contents/MacOS/PhonoFlow"
+          if [[ ! -x "$app_executable" ]]; then
+            echo "Built application is missing at $app_executable." >&2
+            exit 1
+          fi
+
+          "$app_executable" >"${RUNNER_TEMP}/phonoflow-web.log" 2>&1 &
+          app_pid=$!
+          listener_audit_pid=
+          cleanup() {
+            if [[ -n "$listener_audit_pid" ]]; then
+              kill -TERM "$listener_audit_pid" 2>/dev/null || true
+              wait "$listener_audit_pid" 2>/dev/null || true
+            fi
+            kill -TERM "$app_pid" 2>/dev/null || true
+            for _ in {1..10}; do
+              if ! kill -0 "$app_pid" 2>/dev/null; then
+                wait "$app_pid" 2>/dev/null || true
+                return
+              fi
+              sleep 1
+            done
+            kill -KILL "$app_pid" 2>/dev/null || true
+            wait "$app_pid" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in {1..60}; do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              echo "PhonoFlow exited before its remote server became ready." >&2
+              break
+            fi
+            if response="$(
+              curl \
+              --fail \
+              --silent \
+              --show-error \
+              --connect-timeout 1 \
+              --max-time 2 \
+              "${PHONOFLOW_WEBUI_URL}/"
+            )"; then
+              if grep -Fq '<title>PhonoFlow Remote</title>' <<<"$response"; then
+                ready=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+          if [[ "$ready" -ne 1 ]]; then
+            cat "${RUNNER_TEMP}/phonoflow-web.log" >&2
+            exit 1
+          fi
+
+          listener_records="$(
+            lsof -nP -a -p "$app_pid" -iTCP -sTCP:LISTEN -Fn || true
+          )"
+          python3 Scripts/ci/assert_loopback_listener.py \
+            --host "$PHONOFLOW_REMOTE_BIND_HOST" \
+            --port "$PHONOFLOW_REMOTE_PORT" <<<"$listener_records"
+
+          listener_audit_failure="${RUNNER_TEMP}/phonoflow-listener-audit.log"
+          audit_listeners() {
+            while kill -0 "$app_pid" 2>/dev/null; do
+              listener_records="$(
+                lsof -nP -a -p "$app_pid" -iTCP -sTCP:LISTEN -Fn || true
+              )"
+              if ! python3 Scripts/ci/assert_loopback_listener.py \
+                --host "$PHONOFLOW_REMOTE_BIND_HOST" \
+                --port "$PHONOFLOW_REMOTE_PORT" \
+                <<<"$listener_records" >"$listener_audit_failure" 2>&1; then
+                return
+              fi
+              sleep 0.25
+            done
+          }
+          audit_listeners &
+          listener_audit_pid=$!
+
+          Scripts/ci/web.sh acceptance "$PLAYWRIGHT_BROWSER"
+
+          kill -TERM "$listener_audit_pid" 2>/dev/null || true
+          wait "$listener_audit_pid" 2>/dev/null || true
+          listener_audit_pid=
+          if [[ -s "$listener_audit_failure" ]]; then
+            cat "$listener_audit_failure" >&2
+            exit 1
+          fi
+
+          listener_records="$(
+            lsof -nP -a -p "$app_pid" -iTCP -sTCP:LISTEN -Fn || true
+          )"
+          python3 Scripts/ci/assert_loopback_listener.py \
+            --host "$PHONOFLOW_REMOTE_BIND_HOST" \
+            --port "$PHONOFLOW_REMOTE_PORT" <<<"$listener_records"
+
+      - name: Upload browser acceptance results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: acceptance-web-${{ matrix.browser }}
+          path: |
+            **/playwright-report
+            **/test-results
+            ${{ runner.temp }}/phonoflow-web.log
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
