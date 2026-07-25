@@ -70,14 +70,34 @@ def lcov_record(path: Path, counts: dict[int, int]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def llvm_coverage_json(files: dict[Path, set[int]]) -> str:
+def llvm_coverage_json(
+    files: dict[Path, set[int]],
+    *,
+    line_summaries: dict[Path, tuple[int, int]] | None = None,
+) -> str:
     entries = []
     for path, executable_lines in files.items():
         segments = []
         for line in sorted(executable_lines):
             segments.append([line, 1, 1, True, True, False])
             segments.append([line, 2, 0, False, False, False])
-        entries.append({"filename": str(path), "segments": segments})
+        line_count, covered_count = (
+            line_summaries[path]
+            if line_summaries is not None and path in line_summaries
+            else (len(executable_lines), len(executable_lines))
+        )
+        entries.append(
+            {
+                "filename": str(path),
+                "segments": segments,
+                "summary": {
+                    "lines": {
+                        "count": line_count,
+                        "covered": covered_count,
+                    }
+                },
+            }
+        )
     return json.dumps({"data": [{"files": entries}]})
 
 
@@ -669,11 +689,38 @@ class SwiftPackageCoverageGateTests(unittest.TestCase):
                     "end_of_record",
                 ]
             )
-            files = PACKAGE_GATE.parse_lcov(lcov, root)
-        counts = files[str(source.resolve())]
+            coverage = PACKAGE_GATE.parse_lcov(lcov, root)
+        counts = coverage.files[str(source.resolve())]
         self.assertEqual(counts[10], 4)
         for line in (152, 202, 320, 323, 804):
             self.assertEqual(counts[line], 0)
+
+    def test_lcov_accepts_llvm_line_summary_totals_with_physical_da_records(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source = root / "PhonoFlowCore/Sources/PhonoFlowCore/Core.swift"
+            lcov = "\n".join(
+                [
+                    f"SF:{source}",
+                    "DA:10,4",
+                    "DA:20,0",
+                    "LF:4",
+                    "LH:3",
+                    "end_of_record",
+                ]
+            )
+            coverage = PACKAGE_GATE.parse_lcov(lcov, root)
+
+        self.assertEqual(
+            coverage.files[str(source.resolve())],
+            {10: 4, 20: 0},
+        )
+        self.assertEqual(
+            coverage.line_summaries[str(source.resolve())],
+            PACKAGE_GATE.CoverageMeasurement(covered=3, executable=4),
+        )
 
     def test_invalid_lcov_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -704,40 +751,22 @@ class SwiftPackageCoverageGateTests(unittest.TestCase):
                     "SF:first.swift\nSF:second.swift\nend_of_record\n",
                     root,
                 )
-            for name, document, expected_error in (
-                (
-                    "declared lines exceed DA records",
+            with self.assertRaisesRegex(
+                PACKAGE_GATE.CoverageDataError,
+                "declares LH:2 greater than LF:1",
+            ):
+                PACKAGE_GATE.parse_lcov(
                     "\n".join(
                         [
                             "SF:source.swift",
                             "DA:1,1",
-                            "LF:2",
-                            "LH:1",
-                            "end_of_record",
-                        ]
-                    ),
-                    "declares LF:2 but contains 1 unique DA records",
-                ),
-                (
-                    "declared hits exceed covered DA records",
-                    "\n".join(
-                        [
-                            "SF:source.swift",
-                            "DA:1,0",
                             "LF:1",
-                            "LH:1",
+                            "LH:2",
                             "end_of_record",
                         ]
                     ),
-                    "declares LH:1, LF:1, and 0 covered DA records",
-                ),
-            ):
-                with self.subTest(name=name):
-                    with self.assertRaisesRegex(
-                        PACKAGE_GATE.CoverageDataError,
-                        expected_error,
-                    ):
-                        PACKAGE_GATE.parse_lcov(document, root)
+                    root,
+                )
 
     def test_production_scope_uses_exact_benchmark_exclusion(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -885,6 +914,131 @@ class SwiftPackageCoverageGateTests(unittest.TestCase):
         self.assertIn("no coverage base is available", stderr)
         verify.assert_called_once_with("HEAD^")
 
+    def test_package_main_accepts_llvm_line_summary_totals(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source_root = root / "PhonoFlowCore/Sources"
+            source = source_root / "PhonoFlowCore/Core.swift"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "let covered = true\nlet uncovered = false\n",
+                encoding="utf-8",
+            )
+            coverage_path = root / "coverage.lcov"
+            coverage_path.write_text(
+                "\n".join(
+                    [
+                        f"SF:{source}",
+                        "DA:1,4",
+                        "DA:2,0",
+                        "LF:4",
+                        "LH:3",
+                        "end_of_record",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            coverage_json_path = root / "coverage.json"
+            coverage_json_path.write_text(
+                llvm_coverage_json(
+                    {source: {1, 2}},
+                    line_summaries={source: (4, 3)},
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    PACKAGE_GATE,
+                    "run",
+                    return_value=process(0, stdout=str(root)),
+                ),
+                mock.patch.object(
+                    PACKAGE_GATE,
+                    "resolve_base_sha",
+                    return_value="base",
+                ),
+                mock.patch.object(
+                    PACKAGE_GATE,
+                    "changed_swift_lines",
+                    return_value={},
+                ),
+            ):
+                status, stderr = invoke_main(
+                    PACKAGE_GATE,
+                    "--coverage-lcov",
+                    str(coverage_path),
+                    "--coverage-json",
+                    str(coverage_json_path),
+                    "--source-root",
+                    str(source_root),
+                    "--minimum",
+                    "0",
+                )
+
+        self.assertEqual(status, 0)
+        self.assertEqual(stderr, "")
+
+    def test_package_main_rejects_lcov_summary_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            source_root = root / "PhonoFlowCore/Sources"
+            source = source_root / "PhonoFlowCore/Core.swift"
+            source.parent.mkdir(parents=True)
+            source.write_text(
+                "let first = true\nlet second = true\n",
+                encoding="utf-8",
+            )
+            coverage_path = root / "coverage.lcov"
+            coverage_path.write_text(
+                "\n".join(
+                    [
+                        f"SF:{source}",
+                        "DA:1,1",
+                        "DA:2,1",
+                        "LF:2",
+                        "LH:1",
+                        "end_of_record",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            coverage_json_path = root / "coverage.json"
+            coverage_json_path.write_text(
+                llvm_coverage_json({source: {1, 2}}),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(
+                    PACKAGE_GATE,
+                    "run",
+                    return_value=process(0, stdout=str(root)),
+                ),
+                mock.patch.object(
+                    PACKAGE_GATE,
+                    "resolve_base_sha",
+                    return_value="base",
+                ),
+                mock.patch.object(
+                    PACKAGE_GATE,
+                    "changed_swift_lines",
+                    return_value={},
+                ),
+            ):
+                status, stderr = invoke_main(
+                    PACKAGE_GATE,
+                    "--coverage-lcov",
+                    str(coverage_path),
+                    "--coverage-json",
+                    str(coverage_json_path),
+                    "--source-root",
+                    str(source_root),
+                    "--minimum",
+                    "0",
+                )
+
+        self.assertEqual(status, 1)
+        self.assertIn("LLVM JSON reports 2 covered of 2 lines", stderr)
+
     def test_package_main_rejects_incomplete_or_stale_lcov(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -907,13 +1061,13 @@ class SwiftPackageCoverageGateTests(unittest.TestCase):
                             f"SF:{core}",
                             "DA:1,1",
                             "LF:2",
-                            "LH:1",
+                            "LH:2",
                             "end_of_record",
                             "",
                         ]
                     )
                     + valid_other,
-                    "declares LF:2 but contains 1 unique DA records",
+                    "incomplete or stale",
                 ),
                 "empty production record": (
                     "\n".join(

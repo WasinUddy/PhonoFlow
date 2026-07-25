@@ -37,6 +37,12 @@ class CoverageMeasurement:
 
 
 @dataclass(frozen=True)
+class LCOVCoverageData:
+    files: dict[str, dict[int, int]]
+    line_summaries: dict[str, CoverageMeasurement]
+
+
+@dataclass(frozen=True)
 class ChangedCoverage:
     measurement: CoverageMeasurement
     failures: tuple[str, ...]
@@ -147,10 +153,11 @@ def normalized_path(path: str | Path, base: Path | None = None) -> str:
     return str(candidate.resolve()).replace("\\", "/")
 
 
-def parse_lcov(document: str, repository_root: Path) -> dict[str, dict[int, int]]:
+def parse_lcov(document: str, repository_root: Path) -> LCOVCoverageData:
     """Parse LCOV into one maximum execution count per physical source line."""
 
     files: dict[str, dict[int, int]] = {}
+    line_summaries: dict[str, CoverageMeasurement] = {}
     current_path: str | None = None
     current_counts: dict[int, int] = {}
     declared_lines_found: int | None = None
@@ -240,20 +247,26 @@ def parse_lcov(document: str, repository_root: Path) -> dict[str, dict[int, int]
                 raise CoverageDataError(
                     f"LCOV record for {current_path} has no LF/LH completeness totals"
                 )
-            physical_lines_found = len(current_counts)
-            physical_lines_hit = sum(count > 0 for count in current_counts.values())
-            if declared_lines_found != physical_lines_found:
-                raise CoverageDataError(
-                    f"LCOV record for {current_path} declares LF:"
-                    f"{declared_lines_found} but contains "
-                    f"{physical_lines_found} unique DA records"
-                )
-            if declared_lines_hit != physical_lines_hit:
+            # LLVM 21's LF/LH line-summary cardinalities can exceed the unique
+            # physical lines represented by DA (for example when one source
+            # line has multiple mappings or instantiations). Compare LF/LH with
+            # LLVM JSON's matching line summary, and compare DA with the JSON
+            # segment inventory, instead of comparing the two representations.
+            if declared_lines_hit > declared_lines_found:
                 raise CoverageDataError(
                     f"LCOV record for {current_path} declares LH:"
-                    f"{declared_lines_hit}, LF:{declared_lines_found}, and "
-                    f"{physical_lines_hit} covered DA records"
+                    f"{declared_lines_hit} greater than LF:{declared_lines_found}"
                 )
+            line_summary = CoverageMeasurement(
+                covered=declared_lines_hit,
+                executable=declared_lines_found,
+            )
+            previous_summary = line_summaries.get(current_path)
+            if previous_summary is not None and previous_summary != line_summary:
+                raise CoverageDataError(
+                    f"LCOV contains inconsistent LF/LH summaries for {current_path}"
+                )
+            line_summaries[current_path] = line_summary
             merged = files.setdefault(current_path, {})
             for source_line, execution_count in current_counts.items():
                 merged[source_line] = max(
@@ -269,7 +282,7 @@ def parse_lcov(document: str, repository_root: Path) -> dict[str, dict[int, int]
         raise CoverageDataError("LCOV input ends before end_of_record")
     if not saw_record:
         raise CoverageDataError("LCOV input contains no source-file records")
-    return files
+    return LCOVCoverageData(files=files, line_summaries=line_summaries)
 
 
 def executable_lines_from_segments(entry: dict[str, Any]) -> set[int]:
@@ -353,6 +366,63 @@ def json_executable_lines(
                 )
             files[filename] = executable_lines_from_segments(entry)
     return files
+
+
+def json_line_summaries(
+    document: dict[str, Any],
+    source_root: Path,
+    exclusions: set[str],
+) -> dict[str, CoverageMeasurement]:
+    root = normalized_path(source_root).rstrip("/") + "/"
+    data_sets = document.get("data")
+    if not isinstance(data_sets, list):
+        raise CoverageDataError("LLVM coverage JSON has no data sets")
+
+    summaries: dict[str, CoverageMeasurement] = {}
+    for data_set in data_sets:
+        if not isinstance(data_set, dict) or not isinstance(data_set.get("files"), list):
+            raise CoverageDataError("LLVM coverage JSON has an invalid files collection")
+        for entry in data_set["files"]:
+            if not isinstance(entry, dict):
+                raise CoverageDataError("LLVM coverage JSON has an invalid file record")
+            filename = normalized_path(str(entry.get("filename", "")))
+            if (
+                not filename.startswith(root)
+                or not filename.endswith(".swift")
+                or filename in exclusions
+            ):
+                continue
+            raw_summary = entry.get("summary")
+            raw_lines = (
+                raw_summary.get("lines")
+                if isinstance(raw_summary, dict)
+                else None
+            )
+            if not isinstance(raw_lines, dict):
+                raise CoverageDataError(
+                    f"LLVM coverage JSON has no line summary for {filename}"
+                )
+            executable = raw_lines.get("count")
+            covered = raw_lines.get("covered")
+            if (
+                type(executable) is not int
+                or type(covered) is not int
+                or executable < 0
+                or covered < 0
+                or covered > executable
+            ):
+                raise CoverageDataError(
+                    f"LLVM coverage JSON has an invalid line summary for {filename}"
+                )
+            if filename in summaries:
+                raise CoverageDataError(
+                    f"LLVM coverage JSON contains duplicate file data for {filename}"
+                )
+            summaries[filename] = CoverageMeasurement(
+                covered=covered,
+                executable=executable,
+            )
+    return summaries
 
 
 def production_files(
@@ -443,6 +513,29 @@ def validate_production_line_coverage(
             )
 
 
+def validate_line_summaries(
+    files: dict[str, dict[int, int]],
+    lcov_summaries: dict[str, CoverageMeasurement],
+    json_summaries: dict[str, CoverageMeasurement],
+) -> None:
+    for filename in files:
+        lcov_summary = lcov_summaries.get(filename)
+        json_summary = json_summaries.get(filename)
+        if lcov_summary is None:
+            raise CoverageDataError(f"LCOV has no line summary for {filename}")
+        if json_summary is None:
+            raise CoverageDataError(
+                f"LLVM coverage JSON has no line summary for {filename}"
+            )
+        if lcov_summary != json_summary:
+            raise CoverageDataError(
+                f"LCOV line summary for {filename} is "
+                f"LH:{lcov_summary.covered}, LF:{lcov_summary.executable}; "
+                f"LLVM JSON reports {json_summary.covered} covered of "
+                f"{json_summary.executable} lines"
+            )
+
+
 def changed_measurement(
     *,
     files: dict[str, dict[int, int]],
@@ -522,17 +615,30 @@ def main() -> int:
         repository_root = Path(
             run("git", "rev-parse", "--show-toplevel").stdout.strip()
         ).resolve()
-        all_files = parse_lcov(
+        coverage_json = json.loads(
+            args.coverage_json.read_text(encoding="utf-8")
+        )
+        lcov_data = parse_lcov(
             args.coverage_lcov.read_text(encoding="utf-8"),
             repository_root,
         )
-        files = production_files(all_files, args.source_root, exclusions)
+        files = production_files(lcov_data.files, args.source_root, exclusions)
         json_lines = json_executable_lines(
-            json.loads(args.coverage_json.read_text(encoding="utf-8")),
+            coverage_json,
+            args.source_root,
+            exclusions,
+        )
+        json_summaries = json_line_summaries(
+            coverage_json,
             args.source_root,
             exclusions,
         )
         validate_production_line_coverage(files, json_lines)
+        validate_line_summaries(
+            files,
+            lcov_data.line_summaries,
+            json_summaries,
+        )
         aggregate = aggregate_measurement(files)
         source_inventory = production_source_inventory(
             args.source_root,
