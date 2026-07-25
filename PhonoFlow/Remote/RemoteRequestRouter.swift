@@ -29,6 +29,7 @@ public actor RemoteRequestRouter {
             "/styles.css": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
             "/src/app.js": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
             "/src/api.js": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
+            "/src/live-audio.js": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
             "/src/state.js": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
             "/src/spectrogram.js": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
             "/src/view.js": Route(methods: [.get, .head], requiresSession: false, maximumBodyBytes: 0),
@@ -203,8 +204,8 @@ public actor RemoteRequestRouter {
         principal: RemoteSessionPrincipal?
     ) async throws -> RemoteRouteResult {
         switch path {
-        case "/", "/styles.css", "/src/app.js", "/src/api.js", "/src/state.js",
-            "/src/spectrogram.js", "/src/view.js":
+        case "/", "/styles.css", "/src/app.js", "/src/api.js", "/src/live-audio.js",
+            "/src/state.js", "/src/spectrogram.js", "/src/view.js":
             guard let asset = await assets.asset(forRequestPath: path) else {
                 throw RemoteRequestSecurity.problem(
                     status: 404,

@@ -35,12 +35,21 @@ KINDS = {
 
 
 class BenchmarkValidationTests(unittest.TestCase):
-    def validate(self, document: dict[str, object]) -> subprocess.CompletedProcess[str]:
+    def validate(
+        self,
+        document: dict[str, object],
+        *,
+        profile: str | None = "stable",
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "performance.json"
             path.write_text(json.dumps(document), encoding="utf-8")
+            command = [str(SCRIPT)]
+            if profile is not None:
+                command.extend(("--profile", profile))
+            command.append(str(path))
             return subprocess.run(
-                [str(SCRIPT), str(path)],
+                command,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -59,6 +68,56 @@ class BenchmarkValidationTests(unittest.TestCase):
     def test_measured_report_passes(self) -> None:
         result = self.validate(self.measured_report())
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_hosted_profile_reports_main_thread_stall_as_diagnostic(self) -> None:
+        document = self.measured_report()
+        metrics = document["metrics"]
+        assert isinstance(metrics, dict)
+        metrics["main_thread_stall_max_ms"] = 39.5733
+        result = self.validate(document, profile="hosted")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "main_thread_stall_max_ms=39.5733 (strictly gated on stable hardware)",
+            result.stdout,
+        )
+
+    def test_stable_profile_enforces_main_thread_stall_gate(self) -> None:
+        document = self.measured_report()
+        metrics = document["metrics"]
+        assert isinstance(metrics, dict)
+        metrics["main_thread_stall_max_ms"] = 16.7
+        result = self.validate(document, profile="stable")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("main_thread_stall_max_ms failed", result.stderr)
+
+    def test_default_profile_remains_strict(self) -> None:
+        document = self.measured_report()
+        metrics = document["metrics"]
+        assert isinstance(metrics, dict)
+        metrics["main_thread_stall_max_ms"] = 16.7
+        result = self.validate(document, profile=None)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("main_thread_stall_max_ms failed", result.stderr)
+
+    def test_profiles_reject_negative_main_thread_stall(self) -> None:
+        document = self.measured_report()
+        metrics = document["metrics"]
+        assert isinstance(metrics, dict)
+        metrics["main_thread_stall_max_ms"] = -0.01
+        for profile in ("hosted", "stable"):
+            with self.subTest(profile=profile):
+                result = self.validate(document, profile=profile)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("main_thread_stall_max_ms failed", result.stderr)
+
+    def test_hosted_profile_rejects_non_finite_main_thread_stall(self) -> None:
+        document = self.measured_report()
+        metrics = document["metrics"]
+        assert isinstance(metrics, dict)
+        metrics["main_thread_stall_max_ms"] = float("inf")
+        result = self.validate(document, profile="hosted")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("missing required metric main_thread_stall_max_ms", result.stderr)
 
     def test_legacy_numeric_constants_without_provenance_fail(self) -> None:
         result = self.validate(METRICS)
@@ -82,9 +141,11 @@ class BenchmarkValidationTests(unittest.TestCase):
         metrics = document["metrics"]
         assert isinstance(metrics, dict)
         metrics["spectrogram_throughput_x"] = 9.99
-        result = self.validate(document)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("spectrogram_throughput_x failed", result.stderr)
+        for profile in ("hosted", "stable"):
+            with self.subTest(profile=profile):
+                result = self.validate(document, profile=profile)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("spectrogram_throughput_x failed", result.stderr)
 
 
 if __name__ == "__main__":

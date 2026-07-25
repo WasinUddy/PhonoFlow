@@ -354,42 +354,48 @@ final class RemoteInfrastructureCoverageTests: XCTestCase {
 
         let emptyBundle = try makeEmptyBundle(at: root.appendingPathComponent("Empty.bundle"))
         let fixtures: [CoverageAssetFixture] = [
-            .init("/", "index.html", "text/html; charset=utf-8", "no-cache"),
+            .init("/", "index.html", "text/html; charset=utf-8", "no-store"),
             .init(
                 "/styles.css",
                 "styles.css",
                 "text/css; charset=utf-8",
-                "public, max-age=3600"
+                "no-store"
             ),
             .init(
                 "/src/app.js",
                 "src/app.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=3600"
+                "no-store"
             ),
             .init(
                 "/src/api.js",
                 "src/api.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=3600"
+                "no-store"
+            ),
+            .init(
+                "/src/live-audio.js",
+                "src/live-audio.js",
+                "text/javascript; charset=utf-8",
+                "no-store"
             ),
             .init(
                 "/src/state.js",
                 "src/state.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=3600"
+                "no-store"
             ),
             .init(
                 "/src/spectrogram.js",
                 "src/spectrogram.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=3600"
+                "no-store"
             ),
             .init(
                 "/src/view.js",
                 "src/view.js",
                 "text/javascript; charset=utf-8",
-                "public, max-age=3600"
+                "no-store"
             ),
         ]
 

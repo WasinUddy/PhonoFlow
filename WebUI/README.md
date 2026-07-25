@@ -7,6 +7,7 @@ This directory is a dependency-free production dashboard bundled by the native P
 - Serve `index.html`, `styles.css`, and `src/*.js` from the same origin as the API.
 - Pairing uses an `HttpOnly; SameSite=Strict` cookie. All `PUT` and `POST` requests send `X-PhonoFlow-Mutation: 1`.
 - The dashboard consumes `/api/v1/state`, `/api/v1/events`, the versioned mutation routes, and authenticated `/audio/live.wav`.
+- Browser listening begins only after a user gesture, incrementally parses the streaming PCM16 WAV, and keeps Web Audio scheduling and reconnect queues bounded.
 - SSE may use named `snapshot`, `state`, `meters`, `spectrogram`, and `problem` events, or an unnamed `{ "type", "payload" }` envelope.
 - A spectrogram event contains a sequence, timestamp, and exactly 64 intensity bytes as a JSON array or base64.
 - State changes are authoritative and revisioned. The browser does not optimistically change controls.

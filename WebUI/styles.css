@@ -872,14 +872,62 @@ input[type="range"] {
   font-size: 0.78rem;
 }
 
-.listen-button {
+.listen-actions {
+  display: grid;
+  min-width: 0;
+  gap: 0.75rem;
   margin-top: auto;
 }
 
-#live-audio {
+.listen-actions > .inline-note {
+  margin-top: 0;
+}
+
+.live-audio-status {
   width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 0.7rem;
   min-height: 3.25rem;
-  margin-top: auto;
+  padding: 0.72rem 0.8rem;
+  border: 1px solid var(--stroke);
+  border-radius: 0.9rem;
+  background: var(--surface-soft);
+}
+
+.live-audio-status[hidden] {
+  display: none;
+}
+
+.live-audio-status strong,
+.live-audio-status small {
+  display: block;
+}
+
+.live-audio-status strong {
+  font-size: 0.82rem;
+}
+
+.live-audio-status small {
+  margin-top: 0.12rem;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+
+.live-audio-status[data-playback-state="playing"] .status-dot {
+  background: var(--success);
+  box-shadow: 0 0 0 0.25rem color-mix(in srgb, var(--success) 18%, transparent);
+}
+
+.live-audio-status[data-playback-state="starting"] .status-dot,
+.live-audio-status[data-playback-state="reconnecting"] .status-dot {
+  background: var(--warning);
+}
+
+.live-audio-status[data-playback-state="failed"] .status-dot {
+  background: var(--danger);
 }
 
 .eq-controls {

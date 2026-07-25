@@ -3,8 +3,17 @@ import { defineConfig, devices } from "@playwright/test";
 
 const externalServer = process.env.PHONOFLOW_E2E_EXTERNAL_SERVER === "1";
 const baseURL = process.env.PHONOFLOW_WEBUI_URL ?? "http://127.0.0.1:4173";
-const authDirectory = process.env.PHONOFLOW_PLAYWRIGHT_AUTH_DIR
-  ?? path.join("playwright", ".auth");
+const authDirectory = path.resolve(
+  process.env.PHONOFLOW_PLAYWRIGHT_AUTH_DIR
+    ?? path.join(
+      "test-results",
+      `playwright-auth-${process.pid}-${Date.now()}`,
+    ),
+);
+// Setup projects and their dependent browser projects must agree on one state
+// file. Export the generated default before Playwright starts worker processes,
+// while keeping explicitly configured CI/native directories unchanged.
+process.env.PHONOFLOW_PLAYWRIGHT_AUTH_DIR = authDirectory;
 const authStatePath = path.join(authDirectory, "session.json");
 
 export default defineConfig({

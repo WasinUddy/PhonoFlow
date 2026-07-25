@@ -1,4 +1,5 @@
 import { ApiProblem, EventStream, PhonoFlowAPI } from "./api.js";
+import { LiveAudioPlayer } from "./live-audio.js";
 import { createInitialState, decibelsToLinearGain, reducer } from "./state.js";
 import { decodeIntensityColumn } from "./spectrogram.js";
 import {
@@ -13,7 +14,33 @@ const api = new PhonoFlowAPI();
 const events = new EventStream();
 const view = new DashboardView(document);
 let state = createInitialState();
-let verifyingSession = false;
+let documentActive = true;
+let lifecycleGeneration = 0;
+let verificationGeneration = null;
+let audioActionGeneration = 0;
+let mutationSerial = 0;
+const activeMutations = new Map();
+let pairingActionSerial = 0;
+let activePairingAction = null;
+const audioPlayer = new LiveAudioPlayer({
+  onState(playback) {
+    view.renderAudioPlayer(playback);
+  },
+  onError(error) {
+    dispatch({
+      type: "ERROR",
+      error: {
+        title: "Browser playback unavailable",
+        detail: error?.message
+          ?? "Check capture, the audio engine, and this browser’s connection to the Mac.",
+      },
+    });
+  },
+  onUnauthorized() {
+    requirePairing();
+  },
+});
+view.renderAudioPlayer(audioPlayer.snapshot());
 
 function dispatch(action) {
   const next = reducer(state, action);
@@ -38,7 +65,10 @@ function errorModel(error) {
 
 function requirePairing(message = "Your session ended. Pair this browser again.") {
   events.stop();
-  view.stopAudioPlayer();
+  activeMutations.clear();
+  activePairingAction = null;
+  audioActionGeneration += 1;
+  void audioPlayer.stop();
   dispatch({ type: "AUTH_REQUIRED", message });
 }
 
@@ -54,32 +84,60 @@ function applyServerResponse(payload, type = "STATE_PATCH") {
   return true;
 }
 
-async function refreshAuthoritativeState({ restartEvents = false, forceBaseline = false } = {}) {
+function lifecycleIsCurrent(generation) {
+  return documentActive && generation === lifecycleGeneration;
+}
+
+async function refreshAuthoritativeState(
+  { restartEvents = false, forceBaseline = false } = {},
+  generation = lifecycleGeneration,
+) {
   const payload = await api.getState();
+  if (!lifecycleIsCurrent(generation)) return false;
   applyServerResponse(payload, forceBaseline ? "BASELINE" : "SNAPSHOT");
-  if (restartEvents) connectEvents();
+  if (restartEvents) connectEvents(generation);
+  return true;
 }
 
 async function restoreAfterReconnect() {
+  const generation = lifecycleGeneration;
   try {
-    await refreshAuthoritativeState({ forceBaseline: true });
+    await refreshAuthoritativeState({ forceBaseline: true }, generation);
   } catch (error) {
-    if (error instanceof ApiProblem && error.status === 401) requirePairing();
+    if (
+      lifecycleIsCurrent(generation)
+      && error instanceof ApiProblem
+      && error.status === 401
+    ) {
+      requirePairing();
+    }
   }
 }
 
 async function verifySession() {
-  if (verifyingSession || !state.authenticated) return;
-  verifyingSession = true;
+  const generation = lifecycleGeneration;
+  if (
+    !lifecycleIsCurrent(generation)
+    || verificationGeneration === generation
+    || !state.authenticated
+  ) {
+    return;
+  }
+  verificationGeneration = generation;
   try {
     const payload = await api.getState();
+    if (!lifecycleIsCurrent(generation)) return;
     applyServerResponse(payload, "STATE_PATCH");
   } catch (error) {
-    if (error instanceof ApiProblem && error.status === 401) {
+    if (
+      lifecycleIsCurrent(generation)
+      && error instanceof ApiProblem
+      && error.status === 401
+    ) {
       requirePairing();
     }
   } finally {
-    verifyingSession = false;
+    if (verificationGeneration === generation) verificationGeneration = null;
   }
 }
 
@@ -118,27 +176,33 @@ function handleEvent({ type, payload }) {
   }
 }
 
-function connectEvents() {
+function connectEvents(generation = lifecycleGeneration) {
+  if (!lifecycleIsCurrent(generation)) return;
   events.start({
     onConnection(status) {
+      if (!lifecycleIsCurrent(generation)) return;
       const needsFreshBaseline = status === "connected"
         && ["reconnecting", "disconnected"].includes(state.connection);
       dispatch({ type: "CONNECTION", status });
       if (needsFreshBaseline) void restoreAfterReconnect();
       if (status === "reconnecting") void verifySession();
     },
-    onEvent: handleEvent,
+    onEvent(event) {
+      if (lifecycleIsCurrent(generation)) handleEvent(event);
+    },
   });
 }
 
-async function bootstrap() {
+async function bootstrap(generation = lifecycleGeneration) {
   view.render(state);
   try {
     const payload = await api.getState();
+    if (!lifecycleIsCurrent(generation)) return;
     dispatch({ type: "CONNECTION", status: "connected" });
     dispatch({ type: "SNAPSHOT", payload });
-    connectEvents();
+    connectEvents(generation);
   } catch (error) {
+    if (!lifecycleIsCurrent(generation)) return;
     if (error instanceof ApiProblem && error.status === 401) {
       requirePairing("");
       return;
@@ -149,27 +213,41 @@ async function bootstrap() {
 }
 
 async function mutate(key, operation) {
-  if (state.pending[key]) return;
+  const generation = lifecycleGeneration;
+  if (!lifecycleIsCurrent(generation) || state.pending[key]) return;
+  const token = mutationSerial + 1;
+  mutationSerial = token;
+  activeMutations.set(key, token);
+  const mutationIsCurrent = () => (
+    lifecycleIsCurrent(generation)
+    && activeMutations.get(key) === token
+  );
   dispatch({ type: "MUTATION_START", key });
   try {
     const payload = await operation();
+    if (!mutationIsCurrent()) return;
     const applied = applyServerResponse(payload);
-    if (!applied) await refreshAuthoritativeState();
+    if (!applied) await refreshAuthoritativeState({}, generation);
   } catch (error) {
+    if (!mutationIsCurrent()) return;
     if (error instanceof ApiProblem && error.status === 401) {
       requirePairing();
       return;
     }
     if (error instanceof ApiProblem && error.status === 409) {
       try {
-        await refreshAuthoritativeState();
+        await refreshAuthoritativeState({}, generation);
       } catch {
         // Preserve the original conflict as the actionable message.
       }
     }
+    if (!mutationIsCurrent()) return;
     dispatch({ type: "ERROR", error: errorModel(error) });
   } finally {
-    dispatch({ type: "MUTATION_END", key });
+    if (mutationIsCurrent()) {
+      activeMutations.delete(key);
+      dispatch({ type: "MUTATION_END", key });
+    }
   }
 }
 
@@ -181,6 +259,7 @@ view.elements["pairing-code"].addEventListener("input", (event) => {
 
 view.elements["pairing-form"].addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (!documentActive || state.pairing.busy) return;
   const code = view.elements["pairing-code"].value;
   if (!/^[0-9]{6}$/.test(code)) {
     dispatch({ type: "PAIRING_ERROR", message: "Enter all six digits from PhonoFlow Settings." });
@@ -188,19 +267,31 @@ view.elements["pairing-form"].addEventListener("submit", async (event) => {
     return;
   }
 
+  const generation = lifecycleGeneration;
+  const pairingAction = pairingActionSerial + 1;
+  pairingActionSerial = pairingAction;
+  activePairingAction = pairingAction;
+  const pairingIsCurrent = () => (
+    lifecycleIsCurrent(generation)
+    && activePairingAction === pairingAction
+  );
   dispatch({ type: "PAIRING_START" });
   try {
     await api.pair(code);
+    if (!pairingIsCurrent()) return;
     view.elements["pairing-code"].value = "";
     dispatch({ type: "CONNECTION", status: "connected" });
-    await refreshAuthoritativeState({ restartEvents: true });
+    await refreshAuthoritativeState({ restartEvents: true }, generation);
   } catch (error) {
+    if (!pairingIsCurrent()) return;
     const message = error instanceof ApiProblem && error.status === 429
       ? "Too many attempts. Wait before trying another code."
       : error instanceof ApiProblem && [401, 403, 422].includes(error.status)
         ? error.detail || "That code is invalid or expired."
         : error.message || "Could not pair with this Mac.";
     dispatch({ type: "PAIRING_ERROR", message });
+  } finally {
+    if (activePairingAction === pairingAction) activePairingAction = null;
   }
 });
 
@@ -307,24 +398,74 @@ view.elements["spectrum-toggle"].addEventListener("click", () => {
 });
 
 view.elements["prepare-audio"].addEventListener("click", async () => {
+  const actionGeneration = audioActionGeneration + 1;
+  audioActionGeneration = actionGeneration;
+  if (audioPlayer.active) {
+    await audioPlayer.stop();
+    if (actionGeneration === audioActionGeneration && !audioPlayer.active) {
+      view.announce("Browser listening stopped.");
+    }
+    return;
+  }
   try {
-    await view.showAudioPlayer();
-  } catch {
-    // Browsers may require the user to press the native play control after loading.
-    view.announce("Live audio is ready. Use the audio play control to begin.");
+    await audioPlayer.start();
+    if (actionGeneration === audioActionGeneration && audioPlayer.active) {
+      view.announce("Browser listening started.");
+    }
+  } catch (error) {
+    // Abort is the expected result when Stop, logout, or navigation wins a
+    // race with startup. All terminal playback failures are reported by the
+    // player's error callbacks.
+    if (error?.name === "AbortError") return;
   }
 });
 
-view.elements["live-audio"].addEventListener("error", () => {
-  dispatch({
-    type: "ERROR",
-    error: {
-      title: "Browser playback unavailable",
-      detail: "Check capture, the audio engine, and this browser’s connection to the Mac.",
-    },
-  });
-});
+function handlePageHide() {
+  if (!documentActive) return;
+  documentActive = false;
+  lifecycleGeneration += 1;
+  verificationGeneration = null;
+  for (const key of activeMutations.keys()) {
+    dispatch({ type: "MUTATION_END", key });
+  }
+  activeMutations.clear();
+  activePairingAction = null;
+  if (state.pairing.busy) {
+    dispatch({ type: "PAIRING_ERROR", message: "" });
+  }
+  events.stop();
+  audioActionGeneration += 1;
+  void audioPlayer.stop();
+}
 
-window.addEventListener("beforeunload", () => events.stop(), { once: true });
+async function restoreFromBackForwardCache(generation) {
+  dispatch({ type: "CONNECTION", status: "connecting" });
+  try {
+    const payload = await api.getState();
+    if (!lifecycleIsCurrent(generation)) return;
+    dispatch({ type: "CONNECTION", status: "connected" });
+    applyServerResponse(payload, "BASELINE");
+    connectEvents(generation);
+  } catch (error) {
+    if (!lifecycleIsCurrent(generation)) return;
+    if (error instanceof ApiProblem && error.status === 401) {
+      requirePairing();
+      return;
+    }
+    dispatch({ type: "CONNECTION", status: "disconnected" });
+    dispatch({ type: "ERROR", error: errorModel(error) });
+    connectEvents(generation);
+  }
+}
+
+function handlePageShow(event) {
+  if (!event.persisted || documentActive) return;
+  documentActive = true;
+  lifecycleGeneration += 1;
+  void restoreFromBackForwardCache(lifecycleGeneration);
+}
+
+window.addEventListener("pagehide", handlePageHide);
+window.addEventListener("pageshow", handlePageShow);
 
 void bootstrap();

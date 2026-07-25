@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "typecheck": "node --check src/api.js && node --check src/app.js && node --check src/spectrogram.js && node --check src/state.js && node --check src/view.js && node --check tests/fixture-server.mjs",
+    "typecheck": "node --check src/api.js && node --check src/app.js && node --check src/live-audio.js && node --check src/spectrogram.js && node --check src/state.js && node --check src/view.js && node --check tests/fixture-server.mjs",
     "size": "node tests/check-production.mjs",
     "build": "npm run size",
     "test": "vitest run",

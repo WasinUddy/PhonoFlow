@@ -276,6 +276,7 @@ expected = {
     "styles.css",
     "src/api.js",
     "src/app.js",
+    "src/live-audio.js",
     "src/spectrogram.js",
     "src/state.js",
     "src/view.js",

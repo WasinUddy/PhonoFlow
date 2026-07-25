@@ -10,6 +10,7 @@ let state = createFixtureState();
 let pairingCodeAvailable = true;
 let successfulPairings = 0;
 const eventClients = new Set();
+const audioClients = new Set();
 
 const mimeTypes = {
   ".css": "text/css; charset=utf-8",
@@ -71,14 +72,12 @@ function broadcast(type, payload) {
   for (const client of eventClients) client.write(message);
 }
 
-function tinyWAV() {
+function streamingWAVHeader() {
   const sampleRate = 48_000;
   const channels = 2;
-  const samples = 48_000;
-  const dataSize = samples * channels * 2;
-  const buffer = Buffer.alloc(44 + dataSize);
+  const buffer = Buffer.alloc(44);
   buffer.write("RIFF", 0);
-  buffer.writeUInt32LE(36 + dataSize, 4);
+  buffer.writeUInt32LE(0x7fff_ffff, 4);
   buffer.write("WAVE", 8);
   buffer.write("fmt ", 12);
   buffer.writeUInt32LE(16, 16);
@@ -89,14 +88,83 @@ function tinyWAV() {
   buffer.writeUInt16LE(channels * 2, 32);
   buffer.writeUInt16LE(16, 34);
   buffer.write("data", 36);
-  buffer.writeUInt32LE(dataSize, 40);
-  for (let frame = 0; frame < samples; frame += 1) {
-    const value = Math.round(Math.sin((2 * Math.PI * 440 * frame) / sampleRate) * 12_000);
-    const offset = 44 + frame * channels * 2;
+  buffer.writeUInt32LE(0x7fff_ffdb, 40);
+  return buffer;
+}
+
+function pcmChunk(startFrame, frames = 960) {
+  const sampleRate = 48_000;
+  const channels = 2;
+  const buffer = Buffer.alloc(frames * channels * 2);
+  for (let frame = 0; frame < frames; frame += 1) {
+    const value = Math.round(
+      Math.sin((2 * Math.PI * 440 * (startFrame + frame)) / sampleRate) * 12_000,
+    );
+    const offset = frame * channels * 2;
     buffer.writeInt16LE(value, offset);
     buffer.writeInt16LE(value, offset + 2);
   }
   return buffer;
+}
+
+function publishAudioListenerCount() {
+  if (state.radio.listenerCount === audioClients.size) return;
+  state.radio.listenerCount = audioClients.size;
+  advanceRevision();
+  broadcast("state", state);
+}
+
+function removeAudioClient(client, { end = false } = {}) {
+  if (!audioClients.delete(client)) return;
+  clearInterval(client.timer);
+  if (end && !client.response.destroyed && !client.response.writableEnded) {
+    client.response.end();
+  }
+  publishAudioListenerCount();
+}
+
+function closeAudioClients() {
+  for (const client of [...audioClients]) {
+    removeAudioClient(client, { end: true });
+  }
+}
+
+function serveLiveWAV(response) {
+  response.writeHead(200, {
+    "Accept-Ranges": "none",
+    "Cache-Control": "no-store",
+    "Content-Type": "audio/wav",
+    "X-Content-Type-Options": "nosniff",
+  });
+
+  const header = streamingWAVHeader();
+  response.write(header.subarray(0, 13));
+  response.write(header.subarray(13, 43));
+  response.write(header.subarray(43));
+
+  const client = {
+    frame: 0,
+    response,
+    timer: null,
+  };
+  const writePCM = () => {
+    if (response.destroyed || response.writableEnded) {
+      removeAudioClient(client);
+      return;
+    }
+    if (response.writableLength > 64 * 1_024) return;
+    const chunk = pcmChunk(client.frame);
+    client.frame += 960;
+    // Split inside a four-byte stereo frame so acceptance exercises the same
+    // arbitrary network boundaries as a real chunked response.
+    response.write(chunk.subarray(0, 1_919));
+    response.write(chunk.subarray(1_919));
+  };
+  client.timer = setInterval(writePCM, 20);
+  audioClients.add(client);
+  response.on("close", () => removeAudioClient(client));
+  publishAudioListenerCount();
+  writePCM();
 }
 
 async function serveAsset(request, response, pathname) {
@@ -151,6 +219,7 @@ const server = createServer(async (request, response) => {
       const body = method === "POST" ? await readJSON(request) : {};
       if (path === "/__fixture__/stats" && method === "GET") {
         sendJSON(response, 200, {
+          audioClients: audioClients.size,
           eventClients: eventClients.size,
           successfulPairings,
         });
@@ -168,6 +237,7 @@ const server = createServer(async (request, response) => {
         return;
       }
       if (path === "/__fixture__/reset" && method === "POST") {
+        closeAudioClients();
         state = createFixtureState();
         pairingCodeAvailable = true;
         successfulPairings = 0;
@@ -278,14 +348,7 @@ const server = createServer(async (request, response) => {
     }
 
     if (path === "/audio/live.wav" && method === "GET") {
-      const wav = tinyWAV();
-      response.writeHead(200, {
-        "Cache-Control": "no-store",
-        "Content-Length": wav.length,
-        "Content-Type": "audio/wav",
-        "X-Content-Type-Options": "nosniff",
-      });
-      response.end(wav);
+      serveLiveWAV(response);
       return;
     }
 
@@ -306,6 +369,7 @@ server.listen(port, "127.0.0.1", () => {
 });
 
 function shutdown() {
+  closeAudioClients();
   for (const client of eventClients) client.end();
   server.close(() => process.exit(0));
 }

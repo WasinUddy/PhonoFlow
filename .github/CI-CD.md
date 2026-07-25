@@ -59,9 +59,11 @@ The comparison helper also accepts a `metrics` object/array with optional
 `unit`, `lowerIsBetter`, and `maxRegressionPercent` metadata.
 The executable must provide every metric named in
 `Scripts/ci/validate-benchmarks.py`, and each metric must identify the
-instrumentation that produced it. Hosted results are informational but still
-enforce absolute gates. Regression comparisons run only on the stable,
-self-hosted performance runner.
+instrumentation that produced it. The hosted profile enforces deterministic
+absolute gates and records scheduler-sensitive main-thread stall time as a
+diagnostic. The stable profile additionally enforces the 16.7 ms stall ceiling;
+regression comparisons run only on that protected, self-hosted performance
+runner.
 
 ## Repository and environment settings
 

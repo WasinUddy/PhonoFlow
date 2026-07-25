@@ -158,4 +158,39 @@ describe("SSE parsing and reconnect", () => {
     expect(FakeEventSource.instances).toHaveLength(2);
     stream.stop();
   });
+
+  it("ignores queued events from replaced and stopped event sources", () => {
+    class FakeEventSource {
+      constructor() {
+        this.listeners = {};
+        FakeEventSource.instances.push(this);
+      }
+      addEventListener(type, handler) {
+        this.listeners[type] = handler;
+      }
+      close() {
+        this.closed = true;
+      }
+    }
+    FakeEventSource.instances = [];
+    const events = [];
+    const stream = new EventStream({ EventSourceImpl: FakeEventSource });
+
+    stream.start({ onEvent: (event) => events.push(event) });
+    const first = FakeEventSource.instances[0];
+    stream.start({ onEvent: (event) => events.push(event) });
+    const second = FakeEventSource.instances[1];
+
+    first.listeners.state({ data: '{"revision":1}' });
+    first.onmessage({ data: '{"type":"meters","payload":{"sequence":1}}' });
+    expect(events).toEqual([]);
+
+    second.listeners.state({ data: '{"revision":2}' });
+    expect(events).toEqual([{ type: "state", payload: { revision: 2 } }]);
+
+    stream.stop();
+    second.listeners.state({ data: '{"revision":3}' });
+    second.onmessage({ data: '{"type":"meters","payload":{"sequence":2}}' });
+    expect(events).toHaveLength(1);
+  });
 });

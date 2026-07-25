@@ -157,7 +157,10 @@ latency.
 ## Audio compatibility
 
 `/audio/live.wav` is an authenticated, chunked, stereo PCM16/48 kHz WAV stream
-intended for browser playback. Its header uses streaming sentinel sizes.
+intended for browser playback. Its header uses streaming sentinel sizes. The
+dashboard opens it only after a user gesture and schedules bounded PCM blocks
+through Web Audio, which avoids browser media-element byte-range probes while
+keeping the public WAV endpoint compatible with other authenticated clients.
 
 `/stream` preserves the existing Float32 wire format for VLC/mpv compatibility
 and remains gated by Radio. New installations keep it authenticated by default.

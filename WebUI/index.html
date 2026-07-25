@@ -254,9 +254,30 @@
                 <h2 id="listen-title">Listen here</h2>
                 <p class="panel-copy">Playback begins only when you request it. Headphones recommended.</p>
               </div>
-              <button class="primary-button listen-button" id="prepare-audio" type="button">Start browser listening</button>
-              <audio id="live-audio" controls preload="none" aria-label="Live PhonoFlow audio" hidden></audio>
-              <p class="inline-note">PCM16 stereo · 48 kHz · authenticated session</p>
+              <div class="listen-actions">
+                <button
+                  class="primary-button"
+                  id="prepare-audio"
+                  type="button"
+                  aria-controls="live-audio"
+                  aria-pressed="false"
+                >Start browser listening</button>
+                <div
+                  class="live-audio-status"
+                  id="live-audio"
+                  role="status"
+                  aria-label="Live PhonoFlow audio"
+                  data-playback-state="stopped"
+                  hidden
+                >
+                  <span class="status-dot" id="live-audio-dot" aria-hidden="true"></span>
+                  <span>
+                    <strong id="live-audio-title">Browser listening stopped</strong>
+                    <small id="live-audio-detail">No audio stream is connected.</small>
+                  </span>
+                </div>
+                <p class="inline-note">PCM16 stereo · 48 kHz · authenticated session</p>
+              </div>
             </section>
 
             <section class="glass-panel panel eq-panel wide-panel" aria-labelledby="eq-title">

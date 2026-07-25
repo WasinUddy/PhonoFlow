@@ -14,8 +14,10 @@ import { createFixtureState, spectrumColumn } from "../fixtures/state.js";
 const harness = vi.hoisted(() => ({
   api: null,
   apiInstances: [],
+  players: [],
   streams: [],
   ApiProblem: null,
+  windowListeners: [],
 }));
 
 vi.mock("../../src/api.js", () => {
@@ -92,6 +94,71 @@ vi.mock("../../src/api.js", () => {
   return { ApiProblem, EventStream, PhonoFlowAPI };
 });
 
+vi.mock("../../src/live-audio.js", () => {
+  class LiveAudioPlayer {
+    constructor(callbacks = {}) {
+      this.callbacks = callbacks;
+      this.state = "stopped";
+      this.stats = {
+        contextState: "closed",
+        receivedFrames: 0,
+        scheduledFrames: 0,
+        playedFrames: 0,
+        activeSources: 0,
+      };
+      this.start = vi.fn(async () => {
+        this.state = "starting";
+        this.callbacks.onState?.(this.snapshot());
+        this.state = "playing";
+        this.stats = {
+          contextState: "running",
+          receivedFrames: 2_400,
+          scheduledFrames: 2_400,
+          playedFrames: 2_400,
+          activeSources: 1,
+        };
+        const snapshot = this.snapshot();
+        this.callbacks.onState?.(snapshot);
+        return snapshot;
+      });
+      this.stop = vi.fn(async () => {
+        this.state = "stopped";
+        this.stats = {
+          contextState: "closed",
+          receivedFrames: 0,
+          scheduledFrames: 0,
+          playedFrames: 0,
+          activeSources: 0,
+        };
+        const snapshot = this.snapshot();
+        this.callbacks.onState?.(snapshot);
+        return snapshot;
+      });
+      harness.players.push(this);
+    }
+
+    get active() {
+      return ["starting", "playing", "reconnecting"].includes(this.state);
+    }
+
+    snapshot() {
+      return { state: this.state, ...this.stats };
+    }
+
+    fail(error) {
+      this.state = "failed";
+      this.callbacks.onState?.(this.snapshot());
+      this.callbacks.onError?.(error);
+    }
+
+    expireSession() {
+      this.callbacks.onUnauthorized?.();
+    }
+  }
+
+  return { LiveAudioPlayer };
+});
+
 const html = readFileSync(resolve(process.cwd(), "index.html"), "utf8")
   .replace(/<link[^>]+rel="stylesheet"[^>]*>/g, "")
   .replace(/<script[^>]*>[\s\S]*?<\/script>/g, "");
@@ -104,6 +171,12 @@ function makeProblem(status, title = "Request rejected", detail = "") {
 
 function dispatch(element, type) {
   element.dispatchEvent(new Event(type, { bubbles: true, cancelable: true }));
+}
+
+function pageTransition(type, persisted) {
+  const event = new Event(type);
+  Object.defineProperty(event, "persisted", { value: persisted });
+  return event;
 }
 
 function stateAtRevision(revision, update = () => {}) {
@@ -147,9 +220,16 @@ describe("WebUI application controller", () => {
     HTMLMediaElement.prototype.pause = vi.fn();
     HTMLMediaElement.prototype.play = vi.fn().mockResolvedValue(undefined);
     globalThis.requestAnimationFrame = vi.fn();
+    harness.windowListeners = [];
+    const addEventListener = window.addEventListener.bind(window);
+    vi.spyOn(window, "addEventListener").mockImplementation((...arguments_) => {
+      harness.windowListeners.push(arguments_);
+      return addEventListener(...arguments_);
+    });
 
     const snapshot = createFixtureState();
     harness.apiInstances = [];
+    harness.players = [];
     harness.streams = [];
     harness.api = {
       getState: vi.fn().mockResolvedValue(snapshot),
@@ -166,6 +246,9 @@ describe("WebUI application controller", () => {
   });
 
   afterEach(() => {
+    for (const [type, listener, options] of harness.windowListeners) {
+      window.removeEventListener(type, listener, options);
+    }
     vi.restoreAllMocks();
   });
 
@@ -233,8 +316,236 @@ describe("WebUI application controller", () => {
     await waitForCall(harness.api.getState, 3);
     expect(document.getElementById("state-revision").textContent).toBe("1");
 
-    window.dispatchEvent(new Event("beforeunload"));
+    window.dispatchEvent(pageTransition("pagehide", false));
     expect(stream.stop).toHaveBeenCalled();
+  });
+
+  it("stops for pagehide and restores one fresh SSE session from BFCache", async () => {
+    const stream = await loadAuthenticatedApplication();
+    const player = harness.players.at(-1);
+    dispatch(document.getElementById("prepare-audio"), "click");
+    await waitForCall(player.start);
+
+    window.dispatchEvent(pageTransition("pagehide", true));
+    window.dispatchEvent(pageTransition("pagehide", true));
+    expect(stream.stop).toHaveBeenCalledOnce();
+    expect(player.stop).toHaveBeenCalledOnce();
+
+    window.dispatchEvent(pageTransition("pageshow", false));
+    expect(harness.api.getState).toHaveBeenCalledOnce();
+
+    harness.api.getState.mockResolvedValueOnce(stateAtRevision(1));
+    window.dispatchEvent(pageTransition("pageshow", true));
+    await waitForCall(harness.api.getState, 2);
+    await vi.waitFor(() => expect(stream.start).toHaveBeenCalledTimes(2));
+    expect(document.getElementById("state-revision").textContent).toBe("1");
+    expect(player.start).toHaveBeenCalledOnce();
+
+    window.dispatchEvent(pageTransition("pageshow", true));
+    expect(harness.api.getState).toHaveBeenCalledTimes(2);
+    expect(stream.start).toHaveBeenCalledTimes(2);
+
+    window.dispatchEvent(pageTransition("pagehide", true));
+    harness.api.getState.mockResolvedValueOnce(stateAtRevision(2));
+    window.dispatchEvent(pageTransition("pageshow", true));
+    await waitForCall(harness.api.getState, 3);
+    await vi.waitFor(() => expect(stream.start).toHaveBeenCalledTimes(3));
+    expect(stream.stop).toHaveBeenCalledTimes(2);
+    expect(player.stop).toHaveBeenCalledTimes(2);
+    expect(player.start).toHaveBeenCalledOnce();
+  });
+
+  it("does not announce a stale stop after an immediate playback restart", async () => {
+    await loadAuthenticatedApplication();
+    const player = harness.players.at(-1);
+    dispatch(document.getElementById("prepare-audio"), "click");
+    await waitForCall(player.start);
+
+    let finishStop;
+    player.stop.mockImplementationOnce(() => {
+      player.state = "stopped";
+      player.stats = {
+        contextState: "closed",
+        receivedFrames: 0,
+        scheduledFrames: 0,
+        playedFrames: 0,
+        activeSources: 0,
+      };
+      const snapshot = player.snapshot();
+      player.callbacks.onState?.(snapshot);
+      return new Promise((resolve) => {
+        finishStop = () => resolve(snapshot);
+      });
+    });
+
+    dispatch(document.getElementById("prepare-audio"), "click");
+    expect(document.getElementById("prepare-audio").textContent)
+      .toBe("Start browser listening");
+    dispatch(document.getElementById("prepare-audio"), "click");
+    await waitForCall(player.start, 2);
+    expect(document.getElementById("announcer").textContent)
+      .toBe("Browser listening started.");
+
+    finishStop();
+    await nextTask();
+    expect(document.getElementById("announcer").textContent)
+      .toBe("Browser listening started.");
+  });
+
+  it("returns to pairing when BFCache restoration is unauthorized", async () => {
+    const stream = await loadAuthenticatedApplication();
+    window.dispatchEvent(pageTransition("pagehide", true));
+    harness.api.getState.mockRejectedValueOnce(makeProblem(401, "Session expired"));
+    window.dispatchEvent(pageTransition("pageshow", true));
+
+    await vi.waitFor(() => {
+      expect(document.getElementById("pairing-view").hidden).toBe(false);
+    });
+    expect(stream.start).toHaveBeenCalledOnce();
+    expect(stream.stop).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not let a pre-pagehide bootstrap reopen the event stream", async () => {
+    let resolveBootstrap;
+    harness.api.getState.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveBootstrap = resolve;
+    }));
+    const application = import("../../src/app.js");
+    await vi.waitFor(() => expect(harness.api.getState).toHaveBeenCalledOnce());
+
+    window.dispatchEvent(pageTransition("pagehide", true));
+    harness.api.getState.mockResolvedValueOnce(stateAtRevision(2));
+    window.dispatchEvent(pageTransition("pageshow", true));
+    resolveBootstrap(stateAtRevision(99));
+    await application;
+
+    await waitForCall(harness.api.getState, 2);
+    const stream = harness.streams.at(-1);
+    await vi.waitFor(() => expect(stream.start).toHaveBeenCalledOnce());
+    expect(document.getElementById("state-revision").textContent).toBe("2");
+  });
+
+  it("does not let a pre-pagehide mutation affect a restored mutation", async () => {
+    await loadAuthenticatedApplication();
+    let rejectOldMutation;
+    let resolveNewMutation;
+    harness.api.updateMonitor
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => {
+        rejectOldMutation = reject;
+      }))
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        resolveNewMutation = resolve;
+      }));
+
+    const monitor = document.getElementById("monitor-toggle");
+    dispatch(monitor, "click");
+    await waitForCall(harness.api.updateMonitor);
+    expect(monitor.disabled).toBe(true);
+
+    window.dispatchEvent(pageTransition("pagehide", true));
+    harness.api.getState.mockResolvedValueOnce(stateAtRevision(2));
+    window.dispatchEvent(pageTransition("pageshow", true));
+    await waitForCall(harness.api.getState, 2);
+    await vi.waitFor(() => expect(monitor.disabled).toBe(false));
+
+    dispatch(monitor, "click");
+    await waitForCall(harness.api.updateMonitor, 2);
+    expect(monitor.disabled).toBe(true);
+
+    rejectOldMutation(makeProblem(401, "Expired pre-hide session"));
+    await nextTask();
+    expect(document.getElementById("dashboard-view").hidden).toBe(false);
+    expect(monitor.disabled).toBe(true);
+
+    resolveNewMutation(stateAtRevision(3, (next) => {
+      next.monitor.enabled = true;
+    }));
+    await vi.waitFor(() => expect(monitor.disabled).toBe(false));
+    expect(monitor.getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("clears pre-pagehide pending controls even when restoration fails", async () => {
+    const stream = await loadAuthenticatedApplication();
+    let rejectMutation;
+    harness.api.updateMonitor.mockImplementationOnce(() => new Promise((_resolve, reject) => {
+      rejectMutation = reject;
+    }));
+
+    const monitor = document.getElementById("monitor-toggle");
+    dispatch(monitor, "click");
+    await waitForCall(harness.api.updateMonitor);
+    expect(monitor.disabled).toBe(true);
+
+    window.dispatchEvent(pageTransition("pagehide", true));
+    expect(monitor.disabled).toBe(false);
+    harness.api.getState.mockRejectedValueOnce(new Error("Restore unavailable."));
+    window.dispatchEvent(pageTransition("pageshow", true));
+
+    await vi.waitFor(() => {
+      expect(document.getElementById("error-detail").textContent)
+        .toContain("Restore unavailable.");
+    });
+    expect(monitor.disabled).toBe(false);
+    expect(stream.start).toHaveBeenCalledTimes(2);
+    rejectMutation(makeProblem(401, "Expired pre-hide mutation"));
+    await nextTask();
+    expect(document.getElementById("dashboard-view").hidden).toBe(false);
+    expect(monitor.disabled).toBe(false);
+  });
+
+  it("invalidates in-flight mutations when authentication is revoked", async () => {
+    const stream = await loadAuthenticatedApplication();
+    let resolveMutation;
+    harness.api.updateMonitor.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveMutation = resolve;
+    }));
+
+    dispatch(document.getElementById("monitor-toggle"), "click");
+    await waitForCall(harness.api.updateMonitor);
+    stream.handlers.onEvent({
+      type: "problem",
+      payload: { status: 401, title: "Session expired" },
+    });
+    expect(document.getElementById("pairing-view").hidden).toBe(false);
+
+    resolveMutation(stateAtRevision(99, (next) => {
+      next.monitor.enabled = true;
+    }));
+    await nextTask();
+    expect(document.getElementById("pairing-view").hidden).toBe(false);
+    expect(document.getElementById("dashboard-view").hidden).toBe(true);
+  });
+
+  it("invalidates a pairing completion across page lifecycle restoration", async () => {
+    harness.api.getState
+      .mockReset()
+      .mockRejectedValueOnce(makeProblem(401, "Pairing required"))
+      .mockRejectedValueOnce(new Error("Restore unavailable."));
+    let resolvePairing;
+    harness.api.pair.mockImplementationOnce(() => new Promise((resolve) => {
+      resolvePairing = resolve;
+    }));
+    await loadApplication();
+
+    document.getElementById("pairing-code").value = "123456";
+    dispatch(document.getElementById("pairing-form"), "submit");
+    await waitForCall(harness.api.pair);
+    expect(document.getElementById("pair-button").disabled).toBe(true);
+
+    window.dispatchEvent(pageTransition("pagehide", true));
+    expect(document.getElementById("pair-button").disabled).toBe(false);
+    window.dispatchEvent(pageTransition("pageshow", true));
+    await waitForCall(harness.api.getState, 2);
+    await vi.waitFor(() => {
+      expect(document.getElementById("error-detail").textContent)
+        .toContain("Restore unavailable.");
+    });
+
+    resolvePairing({ paired: true });
+    await nextTask();
+    expect(harness.api.getState).toHaveBeenCalledTimes(2);
+    expect(document.getElementById("pairing-view").hidden).toBe(false);
+    expect(document.getElementById("pair-button").disabled).toBe(false);
   });
 
   it("validates, sanitizes, and submits pairing codes with actionable errors", async () => {
@@ -368,15 +679,33 @@ describe("WebUI application controller", () => {
     expect(document.getElementById("announcer").textContent).toBe("Spectrogram resumed.");
 
     dispatch(document.getElementById("prepare-audio"), "click");
-    await nextTask();
-    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
-    expect(document.getElementById("live-audio").getAttribute("src")).toBe("/audio/live.wav");
+    await waitForCall(harness.players.at(-1).start);
+    expect(document.getElementById("prepare-audio").textContent)
+      .toBe("Stop browser listening");
+    expect(document.getElementById("live-audio").dataset).toMatchObject({
+      playbackState: "playing",
+      contextState: "running",
+      scheduledFrames: "2400",
+      playedFrames: "2400",
+    });
+    expect(document.getElementById("announcer").textContent)
+      .toBe("Browser listening started.");
 
-    dispatch(document.getElementById("live-audio"), "error");
+    harness.players.at(-1).fail(new Error("The live audio stream failed."));
     expect(document.getElementById("error-title").textContent)
       .toBe("Browser playback unavailable");
+    expect(document.getElementById("error-detail").textContent)
+      .toBe("The live audio stream failed.");
     dispatch(document.getElementById("dismiss-error"), "click");
     expect(document.getElementById("error-notice").hidden).toBe(true);
+
+    dispatch(document.getElementById("prepare-audio"), "click");
+    await waitForCall(harness.players.at(-1).start, 2);
+    dispatch(document.getElementById("prepare-audio"), "click");
+    await waitForCall(harness.players.at(-1).stop);
+    expect(document.getElementById("live-audio").hidden).toBe(true);
+    expect(document.getElementById("announcer").textContent)
+      .toBe("Browser listening stopped.");
   });
 
   it("suppresses a duplicate pending command and refreshes an empty response", async () => {
@@ -432,7 +761,7 @@ describe("WebUI application controller", () => {
     await waitForCall(harness.api.updateMonitor);
     expect(document.getElementById("pairing-view").hidden).toBe(false);
     expect(stream.stop).toHaveBeenCalled();
-    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled();
+    expect(harness.players.at(-1).stop).toHaveBeenCalled();
 
     harness.api.getState.mockResolvedValueOnce(stateAtRevision(2));
     document.getElementById("pairing-code").value = "123456";
@@ -514,7 +843,7 @@ describe("WebUI application controller", () => {
     });
   });
 
-  it("keeps the original conflict when reconciliation fails and announces blocked playback", async () => {
+  it("keeps the original conflict when reconciliation fails and ignores cancelled playback", async () => {
     await loadAuthenticatedApplication();
 
     harness.api.updateSelection.mockRejectedValueOnce(
@@ -525,10 +854,11 @@ describe("WebUI application controller", () => {
     await waitForCall(harness.api.updateSelection);
     expect(document.getElementById("error-title").textContent).toBe("Selection locked");
 
-    HTMLMediaElement.prototype.play.mockRejectedValueOnce(new Error("Gesture required."));
+    harness.players.at(-1).start.mockRejectedValueOnce(
+      Object.assign(new Error("Stopped."), { name: "AbortError" }),
+    );
     dispatch(document.getElementById("prepare-audio"), "click");
     await nextTask();
-    expect(document.getElementById("announcer").textContent)
-      .toBe("Live audio is ready. Use the audio play control to begin.");
+    expect(document.getElementById("error-title").textContent).toBe("Selection locked");
   });
 });

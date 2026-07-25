@@ -229,7 +229,7 @@ export class EventStream {
     this.source = source;
 
     source.onopen = () => {
-      if (source !== this.source) return;
+      if (!this.running || source !== this.source) return;
       this.retryAttempt = 0;
       this.handlers.onConnection?.("connected");
     };
@@ -237,12 +237,14 @@ export class EventStream {
     const eventTypes = ["snapshot", "state", "meters", "spectrogram", "problem"];
     for (const type of eventTypes) {
       source.addEventListener?.(type, (event) => {
+        if (!this.running || source !== this.source) return;
         const parsed = parseEventPayload(type, event.data);
         if (parsed) this.handlers.onEvent?.(parsed);
       });
     }
 
     source.onmessage = (event) => {
+      if (!this.running || source !== this.source) return;
       const parsed = parseEventPayload("message", event.data);
       if (parsed) this.handlers.onEvent?.(parsed);
     };

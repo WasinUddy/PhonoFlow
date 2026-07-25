@@ -259,6 +259,7 @@
 				"$(SRCROOT)/WebUI/styles.css",
 				"$(SRCROOT)/WebUI/src/api.js",
 				"$(SRCROOT)/WebUI/src/app.js",
+				"$(SRCROOT)/WebUI/src/live-audio.js",
 				"$(SRCROOT)/WebUI/src/spectrogram.js",
 				"$(SRCROOT)/WebUI/src/state.js",
 				"$(SRCROOT)/WebUI/src/view.js",
@@ -271,13 +272,14 @@
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/styles.css",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/src/api.js",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/src/app.js",
+				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/src/live-audio.js",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/src/spectrogram.js",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/src/state.js",
 				"$(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/WebUI/src/view.js",
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -eu\nwebui_destination=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/WebUI\"\n/usr/bin/install -d \"${webui_destination}/src\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/index.html\" \"${webui_destination}/index.html\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/styles.css\" \"${webui_destination}/styles.css\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/api.js\" \"${webui_destination}/src/api.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/app.js\" \"${webui_destination}/src/app.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/spectrogram.js\" \"${webui_destination}/src/spectrogram.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/state.js\" \"${webui_destination}/src/state.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/view.js\" \"${webui_destination}/src/view.js\"\n";
+			shellScript = "set -eu\nwebui_destination=\"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/WebUI\"\n/usr/bin/install -d \"${webui_destination}/src\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/index.html\" \"${webui_destination}/index.html\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/styles.css\" \"${webui_destination}/styles.css\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/api.js\" \"${webui_destination}/src/api.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/app.js\" \"${webui_destination}/src/app.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/live-audio.js\" \"${webui_destination}/src/live-audio.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/spectrogram.js\" \"${webui_destination}/src/spectrogram.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/state.js\" \"${webui_destination}/src/state.js\"\n/usr/bin/install -m 0644 \"${SRCROOT}/WebUI/src/view.js\" \"${webui_destination}/src/view.js\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

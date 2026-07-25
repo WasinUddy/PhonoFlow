@@ -44,8 +44,11 @@ jobs:
       - name: Run deterministic benchmarks
         run: Scripts/ci/run-benchmarks.sh "${RUNNER_TEMP}/performance.json"
 
-      - name: Validate absolute performance gates
-        run: Scripts/ci/validate-benchmarks.py "${RUNNER_TEMP}/performance.json"
+      - name: Validate hosted performance gates
+        run: >-
+          Scripts/ci/validate-benchmarks.py
+          --profile hosted
+          "${RUNNER_TEMP}/performance.json"
 
       - name: Upload benchmark data
         if: always()
@@ -149,7 +152,10 @@ jobs:
         run: Scripts/ci/run-benchmarks.sh "${RUNNER_TEMP}/performance.json"
 
       - name: Validate stable absolute gates
-        run: Scripts/ci/validate-benchmarks.py "${RUNNER_TEMP}/performance.json"
+        run: >-
+          Scripts/ci/validate-benchmarks.py
+          --profile stable
+          "${RUNNER_TEMP}/performance.json"
 
       - name: Enforce regression threshold
         if: steps.baseline.outputs.available == 'true'

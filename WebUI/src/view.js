@@ -120,6 +120,7 @@ export class DashboardView {
     this.document = document;
     this.wasAuthenticated = null;
     this.lastAnnouncement = "";
+    this.lastPlaybackState = null;
     this.elements = {};
     for (const id of [
       "connection-pill", "connection-label", "logout-button", "error-notice", "error-title",
@@ -131,9 +132,9 @@ export class DashboardView {
       "monitor-state", "radio-toggle", "radio-state", "recording-toggle", "recording-state",
       "listener-count", "recording-info", "spectrogram", "spectrum-summary", "spectrum-toggle",
       "auto-gain-toggle", "auto-gain-state", "gain-control", "gain-output", "prepare-audio",
-      "live-audio", "eq-controls", "reset-eq", "diagnostic-connection", "diagnostic-engine",
-      "diagnostic-input", "diagnostic-output", "diagnostic-drops", "diagnostic-xruns",
-      "dismiss-error",
+      "live-audio", "live-audio-dot", "live-audio-title", "live-audio-detail", "eq-controls",
+      "reset-eq", "diagnostic-connection", "diagnostic-engine", "diagnostic-input",
+      "diagnostic-output", "diagnostic-drops", "diagnostic-xruns", "dismiss-error",
     ]) {
       this.elements[id] = document.getElementById(id);
     }
@@ -475,21 +476,39 @@ export class DashboardView {
     this.elements["diagnostic-xruns"].textContent = state.telemetry.xruns.toLocaleString();
   }
 
-  showAudioPlayer() {
-    const audio = this.elements["live-audio"];
-    if (!audio.getAttribute("src")) audio.setAttribute("src", "/audio/live.wav");
-    audio.hidden = false;
-    this.elements["prepare-audio"].hidden = true;
-    audio.load?.();
-    return audio.play?.();
-  }
+  renderAudioPlayer(playback) {
+    const status = playback?.state ?? "stopped";
+    const active = ["starting", "playing", "reconnecting"].includes(status);
+    const button = this.elements["prepare-audio"];
+    const output = this.elements["live-audio"];
+    const labels = {
+      starting: ["Connecting browser audio…", "Waiting for the first PCM frames."],
+      playing: ["Browser listening is live", "PCM16 stereo · 48 kHz"],
+      reconnecting: ["Reconnecting browser audio…", "The Mac stream was interrupted."],
+      failed: ["Browser listening unavailable", "Use Start to try again."],
+      stopped: ["Browser listening stopped", "No audio stream is connected."],
+    };
+    const [title, detail] = labels[status] ?? labels.stopped;
 
-  stopAudioPlayer() {
-    const audio = this.elements["live-audio"];
-    audio.pause?.();
-    audio.removeAttribute("src");
-    audio.load?.();
-    audio.hidden = true;
-    this.elements["prepare-audio"].hidden = false;
+    if (this.lastPlaybackState !== status) {
+      button.textContent = active ? "Stop browser listening" : "Start browser listening";
+      button.setAttribute("aria-pressed", String(active));
+      button.disabled = false;
+      if (status === "starting") button.setAttribute("aria-busy", "true");
+      else button.removeAttribute("aria-busy");
+
+      output.hidden = status === "stopped";
+      this.elements["live-audio-title"].textContent = title;
+      this.elements["live-audio-detail"].textContent = detail;
+      this.elements["live-audio-dot"].className = "status-dot";
+      this.lastPlaybackState = status;
+    }
+
+    output.dataset.playbackState = status;
+    output.dataset.contextState = playback?.contextState ?? "closed";
+    output.dataset.receivedFrames = String(playback?.receivedFrames ?? 0);
+    output.dataset.scheduledFrames = String(playback?.scheduledFrames ?? 0);
+    output.dataset.playedFrames = String(playback?.playedFrames ?? 0);
+    output.dataset.activeSources = String(playback?.activeSources ?? 0);
   }
 }

@@ -18,6 +18,118 @@ async function setSwitch(page, name, enabled) {
   return control;
 }
 
+async function installLiveAudioProbe(page) {
+  await page.addInitScript(() => {
+    const probe = {
+      abortedRequests: 0,
+      audioRequests: 0,
+      contextsClosed: 0,
+      contextsCreated: 0,
+      contextState: "none",
+      endedFrames: 0,
+      lastBufferChannels: 0,
+      lastBufferFrames: 0,
+      lastBufferPeak: 0,
+      lastBufferSampleRate: 0,
+      resumeCalls: 0,
+      scheduledFrames: 0,
+    };
+    Object.defineProperty(globalThis, "__phonoflowAudioProbe", {
+      configurable: true,
+      value: probe,
+    });
+
+    const NativeContext = globalThis.AudioContext ?? globalThis.webkitAudioContext;
+    if (typeof NativeContext === "function") {
+      const nativeCreateBufferSource = NativeContext.prototype.createBufferSource;
+      NativeContext.prototype.createBufferSource = function createBufferSource(...arguments_) {
+        const source = nativeCreateBufferSource.apply(this, arguments_);
+        const nativeStart = source.start.bind(source);
+        source.start = (when, ...startArguments) => {
+          const buffer = source.buffer;
+          if (buffer) {
+            let peak = 0;
+            for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
+              for (const sample of buffer.getChannelData(channel)) {
+                peak = Math.max(peak, Math.abs(sample));
+              }
+            }
+            probe.lastBufferChannels = buffer.numberOfChannels;
+            probe.lastBufferFrames = buffer.length;
+            probe.lastBufferPeak = peak;
+            probe.lastBufferSampleRate = buffer.sampleRate;
+            probe.scheduledFrames += buffer.length;
+            source.addEventListener("ended", () => {
+              probe.endedFrames += buffer.length;
+            }, { once: true });
+          }
+          return nativeStart(when, ...startArguments);
+        };
+        return source;
+      };
+
+      const nativeResume = NativeContext.prototype.resume;
+      NativeContext.prototype.resume = function resume(...arguments_) {
+        probe.resumeCalls += 1;
+        const result = nativeResume.apply(this, arguments_);
+        return Promise.resolve(result).then((value) => {
+          probe.contextState = this.state;
+          return value;
+        });
+      };
+      const nativeClose = NativeContext.prototype.close;
+      NativeContext.prototype.close = function close(...arguments_) {
+        const result = nativeClose.apply(this, arguments_);
+        return Promise.resolve(result).then((value) => {
+          probe.contextsClosed += 1;
+          probe.contextState = this.state;
+          return value;
+        });
+      };
+
+      const InstrumentedContext = new Proxy(NativeContext, {
+        construct(target, arguments_) {
+          probe.contextsCreated += 1;
+          const context = Reflect.construct(target, arguments_, target);
+          probe.contextState = context.state;
+          return context;
+        },
+      });
+      Object.defineProperty(globalThis, "AudioContext", {
+        configurable: true,
+        value: InstrumentedContext,
+        writable: true,
+      });
+    }
+
+    const nativeFetch = globalThis.fetch.bind(globalThis);
+    globalThis.fetch = (input, init = {}) => {
+      const url = new URL(
+        typeof input === "string" || input instanceof URL ? input : input.url,
+        location.href,
+      );
+      if (url.pathname === "/audio/live.wav") {
+        probe.audioRequests += 1;
+        init.signal?.addEventListener("abort", () => {
+          probe.abortedRequests += 1;
+        }, { once: true });
+      }
+      return nativeFetch(input, init);
+    };
+  });
+}
+
+async function remoteAudioListenerCount(page) {
+  return page.evaluate(async () => {
+    const response = await fetch("/api/v1/state", {
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+    const payload = await response.json();
+    return Number(payload?.radio?.listenerCount ?? payload?.state?.radio?.listenerCount ?? 0);
+  });
+}
+
 async function probeStreamingWAV(page) {
   return page.evaluate(async () => {
     const controller = new AbortController();
@@ -179,12 +291,20 @@ test("routes a four-input device and reconciles remote controls", async ({ page 
 });
 
 test("does not request browser audio before a user gesture", async ({ page }) => {
+  await installLiveAudioProbe(page);
   const audioRequests = [];
   page.on("request", (request) => {
-    if (request.url().includes("/audio/live.wav")) audioRequests.push(request.url());
+    if (request.url().includes("/audio/live.wav")) audioRequests.push(request);
   });
   await openAuthenticatedDashboard(page);
   expect(audioRequests).toEqual([]);
+  expect(await page.evaluate(() => (globalThis as any).__phonoflowAudioProbe))
+    .toMatchObject({
+      audioRequests: 0,
+      contextsCreated: 0,
+      resumeCalls: 0,
+      scheduledFrames: 0,
+    });
 
   const audio = page.getByLabel("Live PhonoFlow audio");
   const responsePromise = page.waitForResponse((response) =>
@@ -196,24 +316,73 @@ test("does not request browser audio before a user gesture", async ({ page }) =>
   await expect.poll(() => audioRequests.length).toBeGreaterThan(0);
   expect(response.status()).toBe(200);
   expect(response.headers()["content-type"]).toContain("audio/wav");
-  expect(await audio.evaluate((element) => ({
-    error: element.error?.message ?? null,
-    hasSource: element.networkState !== 3,
-  }))).toEqual({
-    error: null,
-    hasSource: true,
-  });
+  expect(audioRequests[0].method()).toBe("GET");
+  expect(audioRequests[0].headers().range).toBeUndefined();
+  expect(new URL(audioRequests[0].url()).origin).toBe(new URL(page.url()).origin);
 
-  // Release the media element's long-lived stream before opening a direct
-  // response probe. This keeps the test below the production per-IP stream cap.
-  await audio.evaluate((element) => {
-    element.pause();
-    element.removeAttribute("src");
-    element.load();
-  });
+  await expect(page.getByRole("button", { name: "Stop browser listening" }))
+    .toHaveAttribute("aria-pressed", "true");
+  await expect(audio).toHaveAttribute("data-playback-state", "playing");
+  await expect(audio).toHaveAttribute("data-context-state", "running");
+  await expect.poll(async () => Number(await audio.getAttribute("data-scheduled-frames")))
+    .toBeGreaterThan(0);
+  await expect.poll(async () => Number(await audio.getAttribute("data-played-frames")), {
+    timeout: 10_000,
+  }).toBeGreaterThan(0);
   await expect.poll(
-    () => audio.evaluate((element) => element.networkState),
-  ).toBe(0);
+    () => page.evaluate(() => (globalThis as any).__phonoflowAudioProbe),
+    { timeout: 10_000 },
+  ).toMatchObject({
+    audioRequests: 1,
+    contextsCreated: 1,
+    contextState: "running",
+    lastBufferChannels: 2,
+    lastBufferSampleRate: 48_000,
+  });
+  const playbackProbe = await page.evaluate(
+    () => (globalThis as any).__phonoflowAudioProbe,
+  );
+  expect(playbackProbe.lastBufferFrames).toBeGreaterThan(0);
+  expect(playbackProbe.lastBufferPeak).toBeGreaterThan(0);
+  expect(playbackProbe.scheduledFrames).toBeGreaterThan(0);
+  expect(playbackProbe.endedFrames).toBeGreaterThan(0);
+  await expect.poll(() => remoteAudioListenerCount(page), { timeout: 10_000 })
+    .toBeGreaterThanOrEqual(1);
+  await expect.poll(
+    () => page.locator("#listener-count").textContent(),
+    { timeout: 10_000 },
+  ).not.toBe("0");
+
+  await page.getByRole("button", { name: "Stop browser listening" }).click();
+  await expect(page.getByRole("button", { name: "Start browser listening" }))
+    .toHaveAttribute("aria-pressed", "false");
+  await expect(audio).toBeHidden();
+  await expect.poll(
+    () => page.evaluate(
+      () => (globalThis as any).__phonoflowAudioProbe.abortedRequests,
+    ),
+  ).toBeGreaterThanOrEqual(1);
+  await expect.poll(
+    () => page.evaluate(
+      () => (globalThis as any).__phonoflowAudioProbe.contextsClosed,
+    ),
+  ).toBeGreaterThanOrEqual(1);
+  await expect.poll(() => remoteAudioListenerCount(page), { timeout: 10_000 }).toBe(0);
+  await expect(page.locator("#listener-count")).toHaveText("0", { timeout: 10_000 });
+  await page.waitForTimeout(600);
+  expect(audioRequests).toHaveLength(1);
+
+  const restartResponse = page.waitForResponse((candidate) =>
+    candidate.url().includes("/audio/live.wav"),
+  );
+  await page.getByRole("button", { name: "Start browser listening" }).click();
+  expect((await restartResponse).status()).toBe(200);
+  await expect(audio).toHaveAttribute("data-playback-state", "playing");
+  await expect.poll(() => audioRequests.length).toBe(2);
+  await page.getByRole("button", { name: "Stop browser listening" }).click();
+  await expect.poll(() => remoteAudioListenerCount(page), { timeout: 10_000 }).toBe(0);
+  await page.waitForTimeout(600);
+  expect(audioRequests).toHaveLength(2);
 
   const wav = await probeStreamingWAV(page);
   expect(wav).toMatchObject({
@@ -241,6 +410,7 @@ test("does not request browser audio before a user gesture", async ({ page }) =>
   // Duration must still match the 1,024-frame, 48 kHz source payload.
   expect(wav.decodedDuration).toBeCloseTo(1_024 / 48_000, 4);
   expect(wav.decodedPeak).toBeGreaterThan(0);
+  await expect.poll(() => remoteAudioListenerCount(page), { timeout: 10_000 }).toBe(0);
 });
 
 test("renders named meter and spectrogram SSE events", async ({ page, request }) => {

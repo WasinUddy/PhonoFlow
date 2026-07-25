@@ -147,7 +147,8 @@ Release benchmarks produce JSON and then enforce absolute gates:
 
 ```bash
 Scripts/ci/run-benchmarks.sh /tmp/phonoflow-performance.json
-Scripts/ci/validate-benchmarks.py /tmp/phonoflow-performance.json
+Scripts/ci/validate-benchmarks.py --profile hosted /tmp/phonoflow-performance.json
+Scripts/ci/validate-benchmarks.py --profile stable /tmp/phonoflow-performance.json
 ```
 
 Required metrics are:
@@ -157,15 +158,16 @@ Required metrics are:
 | Spectrogram throughput | at least 10× real time |
 | Spectrum publication | 15 ± 1 fps |
 | Capture-to-pixel p95 | below 150 ms |
-| Maximum main-thread stall | below 16.7 ms |
+| Maximum main-thread stall | below 16.7 ms on stable hardware |
 | Analysis operations while hidden | 0 |
 | Maximum pending native frames | no more than 1 |
 | Steady-state STFT allocations | 0 |
 
-Hosted-runner results enforce absolute correctness gates and are uploaded as
-artifacts. Strict regression comparisons run only on an opt-in stable
-self-hosted runner because timing comparisons across changing hosted hardware
-are not meaningful.
+Hosted-runner results enforce every deterministic absolute correctness gate,
+require provenance for all metrics, and retain maximum main-thread stall as a
+finite, nonnegative diagnostic. The 16.7 ms stall ceiling and strict regression
+comparisons run only on an opt-in stable self-hosted runner because scheduler
+latency comparisons across changing hosted hardware are not meaningful.
 
 ## Focusrite hardware acceptance
 

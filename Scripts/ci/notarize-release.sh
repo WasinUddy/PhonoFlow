@@ -286,7 +286,7 @@ source_root = os.path.realpath(sys.argv[1])
 bundle_root = sys.argv[2]
 expected = {
     "index.html", "styles.css", "src/api.js", "src/app.js",
-    "src/spectrogram.js", "src/state.js", "src/view.js",
+    "src/live-audio.js", "src/spectrogram.js", "src/state.js", "src/view.js",
 }
 if os.path.islink(bundle_root):
     raise SystemExit("Bundled WebUI root must not be a symlink")

@@ -85,4 +85,58 @@ describe("dashboard rendering", () => {
     expect(controls[9].getAttribute("aria-label")).toBe("16,000 hertz gain");
     expect(controls.every((control) => control.getAttribute("aria-valuetext") === "0 decibels")).toBe(true);
   });
+
+  it("updates playback telemetry without repeating live-status text mutations", () => {
+    view.renderAudioPlayer({
+      state: "playing",
+      contextState: "running",
+      receivedFrames: 2_400,
+      scheduledFrames: 2_400,
+      playedFrames: 2_400,
+      activeSources: 1,
+    });
+
+    const status = document.getElementById("live-audio");
+    const title = document.getElementById("live-audio-title");
+    const detail = document.getElementById("live-audio-detail");
+    const titleNode = title.firstChild;
+    const detailNode = detail.firstChild;
+
+    view.renderAudioPlayer({
+      state: "playing",
+      contextState: "running",
+      receivedFrames: 4_800,
+      scheduledFrames: 4_800,
+      playedFrames: 4_200,
+      activeSources: 2,
+    });
+
+    expect(title.firstChild).toBe(titleNode);
+    expect(detail.firstChild).toBe(detailNode);
+    expect(status.dataset).toMatchObject({
+      playbackState: "playing",
+      contextState: "running",
+      receivedFrames: "4800",
+      scheduledFrames: "4800",
+      playedFrames: "4200",
+      activeSources: "2",
+    });
+
+    view.renderAudioPlayer({ state: "reconnecting", contextState: "suspended" });
+    expect(title.firstChild).not.toBe(titleNode);
+    expect(detail.firstChild).not.toBe(detailNode);
+    expect(title.textContent).toBe("Reconnecting browser audio…");
+    expect(detail.textContent).toBe("The Mac stream was interrupted.");
+  });
+
+  it("groups the listening control and status in one aligned action area", () => {
+    const actions = document.querySelector(".listen-actions");
+
+    expect(actions).not.toBeNull();
+    expect([...actions.children]).toEqual([
+      document.getElementById("prepare-audio"),
+      document.getElementById("live-audio"),
+      actions.querySelector(".inline-note"),
+    ]);
+  });
 });

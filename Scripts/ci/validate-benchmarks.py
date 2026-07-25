@@ -4,11 +4,24 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import sys
 from pathlib import Path
 from typing import Any
+
+
+COMMON_GATES = {
+    "spectrogram_throughput_x": lambda value: value >= 10.0,
+    "non_native_spectrogram_throughput_x": lambda value: value >= 10.0,
+    "spectrum_fps": lambda value: 14.0 <= value <= 16.0,
+    "capture_to_pixel_p95_ms": lambda value: value < 150.0,
+    "hidden_analysis_operations": lambda value: value == 0.0,
+    "max_pending_frames": lambda value: value <= 1.0,
+    "stft_steady_state_allocations": lambda value: value == 0.0,
+}
+MAIN_THREAD_STALL_GATE_MS = 16.7
 
 
 def metrics(document: dict[str, Any]) -> dict[str, float]:
@@ -44,23 +57,37 @@ def metrics(document: dict[str, Any]) -> dict[str, float]:
     return result
 
 
-def main() -> int:
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <performance.json>", file=sys.stderr)
-        return 2
+def arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate hosted or stable-hardware PhonoFlow performance results. "
+            "The default remains the strict stable profile for compatibility."
+        )
+    )
+    parser.add_argument("performance_json", type=Path)
+    parser.add_argument(
+        "--profile",
+        choices=("hosted", "stable"),
+        default="stable",
+        help=(
+            "hosted keeps scheduler-sensitive main-thread stalls diagnostic; "
+            "stable enforces the 16.7 ms absolute gate (default: stable)"
+        ),
+    )
+    return parser.parse_args()
 
-    document = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+
+def main() -> int:
+    options = arguments()
+
+    document = json.loads(options.performance_json.read_text(encoding="utf-8"))
     values = metrics(document)
-    gates = {
-        "spectrogram_throughput_x": lambda value: value >= 10.0,
-        "non_native_spectrogram_throughput_x": lambda value: value >= 10.0,
-        "spectrum_fps": lambda value: 14.0 <= value <= 16.0,
-        "capture_to_pixel_p95_ms": lambda value: value < 150.0,
-        "main_thread_stall_max_ms": lambda value: value < 16.7,
-        "hidden_analysis_operations": lambda value: value == 0.0,
-        "max_pending_frames": lambda value: value <= 1.0,
-        "stft_steady_state_allocations": lambda value: value == 0.0,
-    }
+    gates = dict(COMMON_GATES)
+    gates["main_thread_stall_max_ms"] = (
+        (lambda value: value >= 0.0)
+        if options.profile == "hosted"
+        else (lambda value: 0.0 <= value < MAIN_THREAD_STALL_GATE_MS)
+    )
     failures: list[str] = []
     measurements = document.get("measurements")
     allowed_measurement_kinds = {
@@ -96,6 +123,12 @@ def main() -> int:
         for failure in failures:
             print(f"error: {failure}", file=sys.stderr)
         return 1
+    if options.profile == "hosted":
+        print(
+            "diagnostic: "
+            f"main_thread_stall_max_ms={values['main_thread_stall_max_ms']:g} "
+            "(strictly gated on stable hardware)"
+        )
     return 0
 
 

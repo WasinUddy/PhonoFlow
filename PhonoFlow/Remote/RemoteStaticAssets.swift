@@ -37,6 +37,9 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
     private let developmentRoot: URL?
     private var cache: [String: RemoteStaticAsset] = [:]
 
+    /// The WebUI uses stable asset paths whose contents change together across app
+    /// releases. Do not let a browser combine a freshly loaded document with
+    /// modules or styles cached from an older app bundle.
     private static let resources: [String: Resource] = [
         "/": Resource(
             name: "index",
@@ -44,7 +47,7 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI",
             developmentRelativePath: "index.html",
             contentType: "text/html; charset=utf-8",
-            cacheControl: "no-cache"
+            cacheControl: "no-store"
         ),
         "/styles.css": Resource(
             name: "styles",
@@ -52,7 +55,7 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI",
             developmentRelativePath: "styles.css",
             contentType: "text/css; charset=utf-8",
-            cacheControl: "public, max-age=3600"
+            cacheControl: "no-store"
         ),
         "/src/app.js": Resource(
             name: "app",
@@ -60,7 +63,7 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI/src",
             developmentRelativePath: "src/app.js",
             contentType: "text/javascript; charset=utf-8",
-            cacheControl: "public, max-age=3600"
+            cacheControl: "no-store"
         ),
         "/src/api.js": Resource(
             name: "api",
@@ -68,7 +71,15 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI/src",
             developmentRelativePath: "src/api.js",
             contentType: "text/javascript; charset=utf-8",
-            cacheControl: "public, max-age=3600"
+            cacheControl: "no-store"
+        ),
+        "/src/live-audio.js": Resource(
+            name: "live-audio",
+            extensionName: "js",
+            bundleSubdirectory: "WebUI/src",
+            developmentRelativePath: "src/live-audio.js",
+            contentType: "text/javascript; charset=utf-8",
+            cacheControl: "no-store"
         ),
         "/src/state.js": Resource(
             name: "state",
@@ -76,7 +87,7 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI/src",
             developmentRelativePath: "src/state.js",
             contentType: "text/javascript; charset=utf-8",
-            cacheControl: "public, max-age=3600"
+            cacheControl: "no-store"
         ),
         "/src/spectrogram.js": Resource(
             name: "spectrogram",
@@ -84,7 +95,7 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI/src",
             developmentRelativePath: "src/spectrogram.js",
             contentType: "text/javascript; charset=utf-8",
-            cacheControl: "public, max-age=3600"
+            cacheControl: "no-store"
         ),
         "/src/view.js": Resource(
             name: "view",
@@ -92,7 +103,7 @@ public actor BundledRemoteStaticAssetProvider: nonisolated RemoteStaticAssetProv
             bundleSubdirectory: "WebUI/src",
             developmentRelativePath: "src/view.js",
             contentType: "text/javascript; charset=utf-8",
-            cacheControl: "public, max-age=3600"
+            cacheControl: "no-store"
         ),
     ]
 
