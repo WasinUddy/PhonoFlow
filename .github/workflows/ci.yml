@@ -1,0 +1,187 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.4.app/Contents/Developer
+  PHONOFLOW_XCODE_VERSION: "26.4"
+
+jobs:
+  native:
+    name: Native (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ARM64
+            runner: macos-26
+            architecture: arm64
+          - name: Intel
+            runner: macos-26-intel
+            architecture: x86_64
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Verify repository and runner contract
+        env:
+          EXPECTED_ARCHITECTURE: ${{ matrix.architecture }}
+        run: Scripts/ci/preflight.sh ci
+
+      - name: Validate CI and release helpers
+        if: matrix.architecture == 'arm64'
+        run: python3 -m unittest discover -s Scripts/ci -p 'test_*.py'
+
+      - name: Lint Swift formatting
+        run: |
+          git ls-files -z -- '*.swift' \
+            | xargs -0 swift format lint \
+                --configuration .swift-format \
+                --parallel \
+                --strict
+
+      - name: Resolve and test Swift packages
+        env:
+          COVERAGE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: Scripts/ci/swift-package-tests.sh
+
+      - name: Resolve Xcode packages
+        run: Scripts/ci/resolve-xcode-packages.sh "${RUNNER_TEMP}/SourcePackages"
+
+      - name: Test native application
+        env:
+          PHONOFLOW_ARCH: ${{ matrix.architecture }}
+        run: |
+          xcodebuild test \
+            -project PhonoFlow.xcodeproj \
+            -scheme PhonoFlow \
+            -testPlan PhonoFlow-CI \
+            -configuration Debug \
+            -destination "platform=macOS,arch=${PHONOFLOW_ARCH}" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData-${PHONOFLOW_ARCH}" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            -resultBundlePath "${RUNNER_TEMP}/PhonoFlow-${PHONOFLOW_ARCH}.xcresult" \
+            -enableCodeCoverage YES \
+            ARCHS="${PHONOFLOW_ARCH}" \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY=- \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Analyze native application
+        env:
+          PHONOFLOW_ARCH: ${{ matrix.architecture }}
+        run: |
+          xcodebuild analyze \
+            -project PhonoFlow.xcodeproj \
+            -scheme PhonoFlow \
+            -configuration Debug \
+            -destination "platform=macOS,arch=${PHONOFLOW_ARCH}" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData-${PHONOFLOW_ARCH}" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            ARCHS="${PHONOFLOW_ARCH}" \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Build Release configuration
+        env:
+          PHONOFLOW_ARCH: ${{ matrix.architecture }}
+        run: |
+          xcodebuild build \
+            -project PhonoFlow.xcodeproj \
+            -scheme PhonoFlow \
+            -configuration Release \
+            -destination "platform=macOS,arch=${PHONOFLOW_ARCH}" \
+            -derivedDataPath "${RUNNER_TEMP}/DerivedData-${PHONOFLOW_ARCH}" \
+            -clonedSourcePackagesDirPath "${RUNNER_TEMP}/SourcePackages" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            ARCHS="${PHONOFLOW_ARCH}" \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO
+
+      - name: Enforce coverage thresholds
+        if: matrix.architecture == 'arm64'
+        env:
+          COVERAGE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          Scripts/ci/coverage-gate.py \
+            --xcresult "${RUNNER_TEMP}/PhonoFlow-arm64.xcresult" \
+            --production-minimum 80 \
+            --changed-minimum 90
+
+      - name: Upload Xcode result bundle
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-results-${{ matrix.architecture }}
+          path: ${{ runner.temp }}/PhonoFlow-${{ matrix.architecture }}.xcresult
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 14
+
+  web:
+    name: WebUI
+    runs-on: macos-26
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.18.0
+
+      - name: Check bundled WebUI
+        env:
+          COVERAGE_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          WEBUI_REQUIRE_CHANGED_COVERAGE: "1"
+        run: |
+          if [[ -z "$COVERAGE_BASE_SHA" ]] || [[ "$COVERAGE_BASE_SHA" =~ ^0+$ ]]; then
+            if [[ "$GITHUB_REF_TYPE" == "branch" && "$GITHUB_REF_NAME" != "main" ]]; then
+              COVERAGE_BASE_SHA="$(git merge-base HEAD origin/main)"
+            else
+              COVERAGE_BASE_SHA="$(git rev-parse HEAD^)"
+            fi
+            export COVERAGE_BASE_SHA
+          fi
+          Scripts/ci/web.sh check
+
+      - name: Exercise deterministic WebUI event flows
+        run: Scripts/ci/web.sh acceptance chromium

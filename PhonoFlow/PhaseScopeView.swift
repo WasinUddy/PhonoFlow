@@ -11,6 +11,7 @@ struct PhaseScopeView: View {
     var points: [(x: Float, y: Float)]
     var theme: ColorTheme
     @State private var showInfo = false
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     var body: some View {
         VStack(spacing: 0) {
@@ -28,7 +29,7 @@ struct PhaseScopeView: View {
                 )
                 Spacer()
             }
-            .padding(.bottom, 4)
+            .padding(.bottom, 6)
 
             Canvas { context, size in
                 let side = min(size.width, size.height)
@@ -36,7 +37,7 @@ struct PhaseScopeView: View {
                 let radius = side / 2 - 8
 
                 // Draw cross-hair guides
-                context.opacity = 0.15
+                context.opacity = colorSchemeContrast == .increased ? 0.38 : 0.2
                 var centerLineV = Path()
                 centerLineV.move(to: CGPoint(x: center.x, y: 0))
                 centerLineV.addLine(to: CGPoint(x: center.x, y: size.height))
@@ -48,15 +49,16 @@ struct PhaseScopeView: View {
                 context.stroke(centerLineH, with: .color(.primary), lineWidth: 0.5)
 
                 // Draw reference circles
-                context.opacity = 0.08
+                context.opacity = colorSchemeContrast == .increased ? 0.24 : 0.12
                 for scale in [0.5, 1.0] {
                     let r = radius * scale
-                    let circle = Path(ellipseIn: CGRect(
-                        x: center.x - r,
-                        y: center.y - r,
-                        width: r * 2,
-                        height: r * 2
-                    ))
+                    let circle = Path(
+                        ellipseIn: CGRect(
+                            x: center.x - r,
+                            y: center.y - r,
+                            width: r * 2,
+                            height: r * 2
+                        ))
                     context.stroke(circle, with: .color(.primary), lineWidth: 0.5)
                 }
 
@@ -78,17 +80,61 @@ struct PhaseScopeView: View {
 
                 let gradient = Gradient(colors: [
                     theme.accent.opacity(0.4),
-                    theme.accent
+                    theme.accent,
                 ])
-                context.stroke(path, with: .linearGradient(
-                    gradient,
-                    startPoint: CGPoint(x: 0, y: 0),
-                    endPoint: CGPoint(x: size.width, y: size.height)
-                ), lineWidth: 1.8)
+                context.stroke(
+                    path,
+                    with: .linearGradient(
+                        gradient,
+                        startPoint: CGPoint(x: 0, y: 0),
+                        endPoint: CGPoint(x: size.width, y: size.height)
+                    ), lineWidth: 1.8)
             }
-            .aspectRatio(1, contentMode: .fit)
-            .background(Color.primary.opacity(0.03))
+            .frame(maxWidth: .infinity)
+            .frame(height: 112)
+            .background(
+                Color.primary.opacity(colorSchemeContrast == .increased ? 0.09 : 0.045)
+            )
             .cornerRadius(6)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Live stereo phase scope")
+            .accessibilityValue(phaseAccessibilityValue)
+            .accessibilityIdentifier("visualization.phaseScope")
+        }
+    }
+
+    private var phaseAccessibilityValue: String {
+        guard points.count > 1 else { return "No phase data" }
+
+        var dotProduct: Double = 0
+        var leftEnergy: Double = 0
+        var rightEnergy: Double = 0
+        for point in points {
+            let left = Double(point.x)
+            let right = Double(point.y)
+            dotProduct += left * right
+            leftEnergy += left * left
+            rightEnergy += right * right
+        }
+
+        guard leftEnergy > 0.000_001 || rightEnergy > 0.000_001 else {
+            return "No signal"
+        }
+        guard leftEnergy > 0.000_001 else { return "Left channel has no signal" }
+        guard rightEnergy > 0.000_001 else { return "Right channel has no signal" }
+
+        let correlation = dotProduct / sqrt(leftEnergy * rightEnergy)
+        switch correlation {
+        case 0.85...:
+            return "Strongly in phase"
+        case 0.35..<0.85:
+            return "Mostly in phase"
+        case -0.35..<0.35:
+            return "Wide stereo image"
+        case -0.85 ..< -0.35:
+            return "Mostly out of phase"
+        default:
+            return "Strongly out of phase"
         }
     }
 }

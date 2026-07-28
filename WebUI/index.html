@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark light">
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; media-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; form-action 'self'"
+    >
+    <meta name="description" content="Private LAN controls for PhonoFlow on this Mac.">
+    <title>PhonoFlow Remote</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <svg class="svg-sprite" aria-hidden="true">
+      <symbol id="icon-shield" viewBox="0 0 24 24">
+        <path d="M12 2.5 20 5.6v5.7c0 5-3.3 8.6-8 10.2-4.7-1.6-8-5.2-8-10.2V5.6L12 2.5Z"/>
+        <path d="m8.4 12 2.2 2.2 5-5"/>
+      </symbol>
+      <symbol id="icon-monitor" viewBox="0 0 24 24">
+        <path d="M4.5 13.5v-3a7.5 7.5 0 0 1 15 0v3"/>
+        <path d="M4.5 13h2.8v6H5.7a1.2 1.2 0 0 1-1.2-1.2V13Zm15 0h-2.8v6h1.6a1.2 1.2 0 0 0 1.2-1.2V13Z"/>
+      </symbol>
+      <symbol id="icon-radio" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="1.5"/>
+        <path d="M8.7 8.7a4.7 4.7 0 0 0 0 6.6m6.6-6.6a4.7 4.7 0 0 1 0 6.6"/>
+        <path d="M5.7 5.7a8.9 8.9 0 0 0 0 12.6m12.6-12.6a8.9 8.9 0 0 1 0 12.6"/>
+      </symbol>
+    </svg>
+    <a class="skip-link" href="#main-content">Skip to audio controls</a>
+    <div class="ambient ambient-one" aria-hidden="true"></div>
+    <div class="ambient ambient-two" aria-hidden="true"></div>
+
+    <header class="app-header">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span><span></span><span></span>
+        </span>
+        <span>
+          <span class="brand-name">PhonoFlow</span>
+          <span class="brand-edition">Remote</span>
+        </span>
+      </div>
+      <div class="header-actions">
+        <p class="connection-pill" id="connection-pill">
+          <span class="status-dot" aria-hidden="true"></span>
+          <span id="connection-label">Connecting…</span>
+        </p>
+        <button class="quiet-button" id="logout-button" type="button" hidden>Log out</button>
+      </div>
+    </header>
+
+    <div class="shell">
+      <div class="notice error-notice" id="error-notice" role="alert" aria-atomic="true" hidden>
+        <div>
+          <strong id="error-title">Something went wrong</strong>
+          <p id="error-detail"></p>
+        </div>
+        <button class="icon-button" id="dismiss-error" type="button" aria-label="Dismiss error">×</button>
+      </div>
+
+      <div class="visually-hidden" id="announcer" role="status" aria-live="polite" aria-atomic="true"></div>
+
+      <main id="main-content" tabindex="-1">
+        <section class="pairing-layout" id="pairing-view" aria-labelledby="pairing-title">
+          <article class="glass-panel pairing-card">
+            <p class="eyebrow">Private LAN access</p>
+            <h1 id="pairing-title">Pair with this Mac</h1>
+            <p class="intro">
+              Enter the six-digit code shown in PhonoFlow Settings. The code expires after ten minutes.
+            </p>
+            <form id="pairing-form" novalidate>
+              <label for="pairing-code">Pairing code</label>
+              <input
+                class="pairing-input"
+                id="pairing-code"
+                name="code"
+                type="text"
+                inputmode="numeric"
+                autocomplete="one-time-code"
+                pattern="[0-9]{6}"
+                minlength="6"
+                maxlength="6"
+                aria-describedby="pairing-hint pairing-error"
+                placeholder="000000"
+                required
+              >
+              <p class="field-hint" id="pairing-hint">Six digits · one browser session</p>
+              <p class="field-error" id="pairing-error" aria-live="polite"></p>
+              <button class="primary-button" id="pair-button" type="submit">Pair securely</button>
+            </form>
+            <div class="security-note">
+              <svg class="svg-icon" aria-hidden="true"><use href="#icon-shield"></use></svg>
+              <p>Use only on a network you trust. Do not expose or port-forward this page.</p>
+            </div>
+          </article>
+        </section>
+
+        <div id="dashboard-view" hidden>
+          <section class="hero glass-panel" aria-labelledby="dashboard-title">
+            <div>
+              <p class="eyebrow">Live audio workspace</p>
+              <h1 id="dashboard-title" tabindex="-1">Your sound, in flow.</h1>
+              <p class="hero-copy" id="engine-description">Waiting for the audio engine.</p>
+            </div>
+            <dl class="hero-stats">
+              <div>
+                <dt>Engine</dt>
+                <dd><span class="status-dot" id="engine-dot" aria-hidden="true"></span><span id="engine-state">Idle</span></dd>
+              </div>
+              <div>
+                <dt>Format</dt>
+                <dd id="engine-format">—</dd>
+              </div>
+              <div>
+                <dt>Revision</dt>
+                <dd id="state-revision">0</dd>
+              </div>
+            </dl>
+          </section>
+
+          <div class="dashboard-grid">
+            <section class="glass-panel panel routing-panel" aria-labelledby="routing-title">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Signal path</p>
+                  <h2 id="routing-title">Audio routing</h2>
+                </div>
+                <button class="quiet-button compact" id="refresh-devices" type="button">Refresh</button>
+              </div>
+              <fieldset class="control-stack">
+                <legend class="visually-hidden">Audio routing</legend>
+                <div class="field">
+                  <label for="input-device">Input device</label>
+                  <select id="input-device" name="inputUID">
+                    <option value="">No input available</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="input-route">Input channels</label>
+                  <select id="input-route" name="inputRouteID">
+                    <option value="">No channel pair available</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="output-device">Monitoring output</label>
+                  <select id="output-device" name="outputUID">
+                    <option value="">No output (capture only)</option>
+                  </select>
+                </div>
+              </fieldset>
+              <p class="inline-note" id="routing-note">Input changes are locked while recording.</p>
+            </section>
+
+            <section class="glass-panel panel meters-panel" aria-labelledby="meters-title">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Input level</p>
+                  <h2 id="meters-title">Stereo meters</h2>
+                </div>
+                <span class="live-badge" id="signal-badge">No signal</span>
+              </div>
+              <div class="meter-group">
+                <div class="meter-row">
+                  <span class="meter-channel">L</span>
+                  <meter id="left-meter" min="-60" max="0" low="-18" high="-6" optimum="-12" value="-60" aria-label="Left channel level">
+                    Left channel: −60 dB
+                  </meter>
+                  <output id="left-meter-value" for="left-meter">−60.0 dB</output>
+                </div>
+                <div class="meter-row">
+                  <span class="meter-channel">R</span>
+                  <meter id="right-meter" min="-60" max="0" low="-18" high="-6" optimum="-12" value="-60" aria-label="Right channel level">
+                    Right channel: −60 dB
+                  </meter>
+                  <output id="right-meter-value" for="right-meter">−60.0 dB</output>
+                </div>
+              </div>
+              <div class="action-grid" aria-label="Audio actions">
+                <button class="switch-button" id="monitor-toggle" type="button" role="switch" aria-checked="false">
+                  <svg class="action-icon svg-icon" aria-hidden="true"><use href="#icon-monitor"></use></svg>
+                  <span><strong>Monitor</strong><small id="monitor-state">Off</small></span>
+                  <span class="switch-track" aria-hidden="true"><span></span></span>
+                </button>
+                <button class="switch-button" id="radio-toggle" type="button" role="switch" aria-checked="false">
+                  <svg class="action-icon svg-icon" aria-hidden="true"><use href="#icon-radio"></use></svg>
+                  <span><strong>Radio</strong><small id="radio-state">Off</small></span>
+                  <span class="switch-track" aria-hidden="true"><span></span></span>
+                </button>
+                <button class="switch-button recording-control" id="recording-toggle" type="button" role="switch" aria-checked="false">
+                  <span class="action-icon record-dot" aria-hidden="true"></span>
+                  <span><strong>Record</strong><small id="recording-state">Ready</small></span>
+                  <span class="switch-track" aria-hidden="true"><span></span></span>
+                </button>
+              </div>
+              <dl class="activity-details">
+                <div><dt>Listeners</dt><dd id="listener-count">0</dd></div>
+                <div><dt>Recording</dt><dd id="recording-info">Not recording</dd></div>
+              </dl>
+            </section>
+
+            <section class="glass-panel panel spectrum-panel wide-panel" aria-labelledby="spectrum-title">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Continuous analysis</p>
+                  <h2 id="spectrum-title">Spectrogram</h2>
+                </div>
+                <button class="quiet-button compact" id="spectrum-toggle" type="button" aria-pressed="false">
+                  Pause
+                </button>
+              </div>
+              <figure>
+                <div class="spectrum-frame">
+                  <span class="frequency-label high">20 kHz</span>
+                  <canvas
+                    id="spectrogram"
+                    width="640"
+                    height="256"
+                    role="img"
+                    aria-label="Scrolling audio spectrogram from 20 hertz to 20 kilohertz"
+                    aria-describedby="spectrum-summary"
+                  >A scrolling visualization of audio frequencies.</canvas>
+                  <span class="frequency-label low">20 Hz</span>
+                </div>
+                <figcaption id="spectrum-summary">Waiting for spectrum data.</figcaption>
+              </figure>
+            </section>
+
+            <section class="glass-panel panel processing-panel" aria-labelledby="processing-title">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Dynamics</p>
+                  <h2 id="processing-title">Processing</h2>
+                </div>
+                <button class="switch-button minimal" id="auto-gain-toggle" type="button" role="switch" aria-checked="false">
+                  <span><strong>Auto gain</strong><small id="auto-gain-state">Off</small></span>
+                  <span class="switch-track" aria-hidden="true"><span></span></span>
+                </button>
+              </div>
+              <div class="range-field">
+                <div class="range-heading">
+                  <label for="gain-control">Input gain</label>
+                  <output id="gain-output" for="gain-control">0.0 dB</output>
+                </div>
+                <input id="gain-control" type="range" min="-60" max="12" step="0.5" value="0">
+                <div class="range-scale gain-scale" aria-hidden="true"><span>Mute</span><span class="unity-label">0 dB</span><span>+12</span></div>
+              </div>
+            </section>
+
+            <section class="glass-panel panel listen-panel" aria-labelledby="listen-title">
+              <div>
+                <p class="eyebrow">Browser playback</p>
+                <h2 id="listen-title">Listen here</h2>
+                <p class="panel-copy">Playback begins only when you request it. Headphones recommended.</p>
+              </div>
+              <div class="listen-actions">
+                <button
+                  class="primary-button"
+                  id="prepare-audio"
+                  type="button"
+                  aria-controls="live-audio"
+                  aria-pressed="false"
+                >Start browser listening</button>
+                <div
+                  class="live-audio-status"
+                  id="live-audio"
+                  role="status"
+                  aria-label="Live PhonoFlow audio"
+                  data-playback-state="stopped"
+                  hidden
+                >
+                  <span class="status-dot" id="live-audio-dot" aria-hidden="true"></span>
+                  <span>
+                    <strong id="live-audio-title">Browser listening stopped</strong>
+                    <small id="live-audio-detail">No audio stream is connected.</small>
+                  </span>
+                </div>
+                <p class="inline-note">PCM16 stereo · 48 kHz · authenticated session</p>
+              </div>
+            </section>
+
+            <section class="glass-panel panel eq-panel wide-panel" aria-labelledby="eq-title">
+              <div class="section-heading">
+                <div>
+                  <p class="eyebrow">Tone shaping</p>
+                  <h2 id="eq-title">Ten-band equalizer</h2>
+                </div>
+                <button class="quiet-button compact" id="reset-eq" type="button">Reset all</button>
+              </div>
+              <fieldset>
+                <legend class="visually-hidden">Equalizer gain by frequency</legend>
+                <div class="eq-controls" id="eq-controls"></div>
+              </fieldset>
+            </section>
+
+            <details class="glass-panel diagnostics-panel wide-panel">
+              <summary>Diagnostics</summary>
+              <dl class="diagnostics-grid">
+                <div><dt>Connection</dt><dd id="diagnostic-connection">Connecting</dd></div>
+                <div><dt>Engine state</dt><dd id="diagnostic-engine">Idle</dd></div>
+                <div><dt>Input</dt><dd id="diagnostic-input">None</dd></div>
+                <div><dt>Output</dt><dd id="diagnostic-output">None</dd></div>
+                <div><dt>Dropped frames</dt><dd id="diagnostic-drops">0</dd></div>
+                <div><dt>XRUNs</dt><dd id="diagnostic-xruns">0</dd></div>
+              </dl>
+            </details>
+          </div>
+        </div>
+      </main>
+
+      <footer class="app-footer">
+        <p>PhonoFlow Remote works only on your trusted local network.</p>
+        <p>No audio or control data leaves this Mac through this interface.</p>
+      </footer>
+    </div>
+    <script type="module" src="/src/app.js"></script>
+  </body>
+</html>

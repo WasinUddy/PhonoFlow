@@ -1,0 +1,31 @@
+{
+  "configurations" : [
+    {
+      "id" : "227743D2-6D8C-4DC0-8C9D-F186FF703F36",
+      "name" : "Fake Scarlett",
+      "options" : {
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : false,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:PhonoFlow.xcodeproj",
+      "identifier" : "081D97BA2F74DC85003C5872",
+      "name" : "PhonoFlow"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : false,
+      "skippedTests" : [
+      ],
+      "target" : {
+        "containerPath" : "container:PhonoFlow.xcodeproj",
+        "identifier" : "E10000000000000000000001",
+        "name" : "PhonoFlowUITests"
+      }
+    }
+  ],
+  "version" : 1
+}

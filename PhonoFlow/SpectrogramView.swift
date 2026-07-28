@@ -12,9 +12,11 @@ struct SpectrogramView: View {
     var sampleRate: Double
     var theme: ColorTheme
     @State private var showInfo = false
+    @Environment(\.colorSchemeContrast) private var colorSchemeContrast
 
     private let minFreq: Double = 20
     private let maxFreq: Double = 20000
+    private let frequencyAxisWidth: CGFloat = 32
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,36 +33,45 @@ struct SpectrogramView: View {
                     ]
                 )
                 Spacer()
+                Text(sampleRateLabel)
+                    .font(.system(size: 8, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.white.opacity(0.58))
+                    .accessibilityHidden(true)
+                Text("•")
+                    .font(.system(size: 8))
+                    .foregroundStyle(.white.opacity(0.35))
+                    .accessibilityHidden(true)
                 Text("\u{2190} TIME")
                     .font(.system(size: 8, weight: .medium, design: .monospaced))
-                    .foregroundStyle(.primary.opacity(0.3))
+                    .foregroundStyle(.white.opacity(0.58))
+                    .accessibilityHidden(true)
             }
             .padding(.bottom, 6)
 
             HStack(spacing: 0) {
                 frequencyAxis
-                    .frame(width: 32)
+                    .frame(width: frequencyAxisWidth)
 
                 ZStack {
-                    // Background
                     RoundedRectangle(cornerRadius: 6)
-                        .fill(Color.primary.opacity(0.03))
+                        .fill(Color(red: 0.012, green: 0.016, blue: 0.027))
 
                     if let image = spectrogramImage {
-                        // .medium gives smooth visuals without the heavy per-frame
-                        // Lanczos pass that .high triggers every redraw at 20+ fps.
                         Image(decorative: image, scale: 1)
                             .resizable()
                             .interpolation(.medium)
                             .antialiased(false)
-                            .cornerRadius(6)
+                            .clipShape(RoundedRectangle(cornerRadius: 6))
                     } else {
-                        Text("No signal")
-                            .font(.system(size: 11, weight: .medium))
-                            .foregroundStyle(.primary.opacity(0.3))
+                        ContentUnavailableView {
+                            Label("No Signal", systemImage: "waveform.slash")
+                        } description: {
+                            Text("Waiting for spectrum data")
+                        }
+                        .font(.system(size: 10))
+                        .foregroundStyle(.white.opacity(0.56))
                     }
 
-                    // Frequency grid overlay
                     Canvas { context, size in
                         let logMin = log10(minFreq)
                         let logRange = log10(maxFreq) - logMin
@@ -73,17 +84,39 @@ struct SpectrogramView: View {
                                 var line = Path()
                                 line.move(to: CGPoint(x: 0, y: y))
                                 line.addLine(to: CGPoint(x: size.width, y: y))
-                                context.stroke(line, with: .color(.white.opacity(0.12)), lineWidth: 0.5)
+                                context.stroke(
+                                    line,
+                                    with: .color(
+                                        .white.opacity(
+                                            colorSchemeContrast == .increased ? 0.28 : 0.12
+                                        )),
+                                    lineWidth: colorSchemeContrast == .increased ? 1 : 0.5
+                                )
                             }
                         }
                     }
                     .allowsHitTesting(false)
                 }
+                .overlay {
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(theme.accent.opacity(0.34), lineWidth: 1)
+                        .allowsHitTesting(false)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Live spectrogram")
+                .accessibilityValue(
+                    spectrogramImage == nil
+                        ? "No spectrum data"
+                        : "Frequency history from 20 hertz to 20000 hertz at \(sampleRateLabel)"
+                )
+                .accessibilityIdentifier("visualization.spectrogram")
             }
             .frame(height: 180)
 
             intensityLegend
                 .padding(.top, 4)
+                .padding(.leading, frequencyAxisWidth)
+                .accessibilityHidden(true)
         }
     }
 
@@ -92,6 +125,8 @@ struct SpectrogramView: View {
     private var frequencyAxis: some View {
         GeometryReader { geo in
             let height = geo.size.height
+            let labelWidth = max(0, geo.size.width - 4)
+            let labelHeight: CGFloat = 10
             let logMin = log10(minFreq)
             let logRange = log10(maxFreq) - logMin
 
@@ -111,17 +146,25 @@ struct SpectrogramView: View {
             ZStack(alignment: .trailing) {
                 ForEach(labels, id: \.0) { label, freq in
                     let logPos = (log10(freq) - logMin) / logRange
-                    let y = height - height * CGFloat(logPos)
+                    let rawY = height - height * CGFloat(logPos)
+                    let y = min(
+                        max(rawY, labelHeight / 2),
+                        height - labelHeight / 2
+                    )
 
-                    if y >= 4, y <= height - 4 {
-                        Text(label)
-                            .font(.system(size: 7, weight: .medium, design: .monospaced))
-                            .foregroundStyle(.primary.opacity(0.45))
-                            .position(x: 14, y: y)
-                    }
+                    Text(label)
+                        .font(.system(size: 7, weight: .medium, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.58))
+                        .frame(
+                            width: labelWidth,
+                            height: labelHeight,
+                            alignment: .trailing
+                        )
+                        .position(x: labelWidth / 2, y: y)
                 }
             }
         }
+        .accessibilityHidden(true)
     }
 
     // MARK: - Intensity Legend
@@ -130,7 +173,7 @@ struct SpectrogramView: View {
         HStack(spacing: 4) {
             Text("Quiet")
                 .font(.system(size: 7, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary.opacity(0.35))
+                .foregroundStyle(.white.opacity(0.52))
 
             LinearGradient(
                 colors: [
@@ -152,13 +195,19 @@ struct SpectrogramView: View {
 
             Text("Loud")
                 .font(.system(size: 7, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary.opacity(0.35))
+                .foregroundStyle(.white.opacity(0.52))
 
             Spacer()
 
             Text("Hz")
                 .font(.system(size: 7, weight: .medium, design: .monospaced))
-                .foregroundStyle(.primary.opacity(0.35))
+                .foregroundStyle(.white.opacity(0.52))
         }
+    }
+
+    private var sampleRateLabel: String {
+        sampleRate >= 1_000
+            ? String(format: "%.1f kHz", sampleRate / 1_000)
+            : String(format: "%.0f Hz", sampleRate)
     }
 }

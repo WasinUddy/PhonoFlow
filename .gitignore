@@ -16,12 +16,18 @@ DerivedData/
 *.ipa
 *.xcuserstate
 *.xcarchive
+*.profraw
+*.p12
+*.p8
+*.pem
+*.key
 
 # Swift Package Manager
 .build/
 Packages/
 Package.pins
 Package.resolved
+!PhonoFlow.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # CocoaPods
 Pods/
@@ -37,3 +43,10 @@ Carthage/Build/
 # Backup files
 *.old
 *.backup
+
+# Signing credentials
+*.p8
+*.p12
+*.pem
+*.pfx
+*.key

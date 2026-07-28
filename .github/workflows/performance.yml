@@ -1,0 +1,190 @@
+name: Performance
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  schedule:
+    - cron: "17 18 * * 0"
+  workflow_dispatch:
+    inputs:
+      stable_runner:
+        description: Run strict regression checks on the protected stable runner
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: performance-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.4.app/Contents/Developer
+  PHONOFLOW_XCODE_VERSION: "26.4"
+
+jobs:
+  benchmark:
+    name: Release benchmark
+    runs-on: macos-26
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Run deterministic benchmarks
+        run: Scripts/ci/run-benchmarks.sh "${RUNNER_TEMP}/performance.json"
+
+      - name: Validate hosted performance gates
+        run: >-
+          Scripts/ci/validate-benchmarks.py
+          --profile hosted
+          "${RUNNER_TEMP}/performance.json"
+
+      - name: Upload benchmark data
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-hosted-${{ github.run_id }}
+          path: ${{ runner.temp }}/performance.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  stable-regression:
+    name: Stable hardware regression
+    if: >-
+      vars.PHONOFLOW_PERFORMANCE_RUNNER_ENABLED == 'true' &&
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'schedule' ||
+      (github.event_name == 'workflow_dispatch' && inputs.stable_runner))
+    runs-on:
+      - self-hosted
+      - macOS
+      - performance
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          clean: true
+          persist-credentials: false
+
+      - name: Verify Xcode toolchain
+        run: Scripts/ci/check-xcode.sh
+
+      - name: Download previous stable baseline
+        id: baseline
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs_path="${RUNNER_TEMP}/stable-performance-runs.tsv"
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            --paginate \
+            "/repos/${GITHUB_REPOSITORY}/actions/workflows/performance.yml/runs?branch=main&status=success&per_page=100" \
+            --jq '.workflow_runs[] | select(.event == "schedule" or .event == "workflow_dispatch") | [.created_at, .id] | @tsv' \
+            > "$runs_path"
+
+          artifact_id=""
+          while IFS=$'\t' read -r _ run_id; do
+            [[ -n "$run_id" ]] || continue
+            artifact_id="$(
+              gh api \
+                -H "Accept: application/vnd.github+json" \
+                "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?name=performance-baseline&per_page=100" \
+                --jq '[.artifacts[] | select(.expired == false and .name == "performance-baseline")] | sort_by(.created_at) | last | .id // empty'
+            )"
+            [[ -z "$artifact_id" ]] || break
+          done < <(sort -r "$runs_path")
+
+          if [[ -z "$artifact_id" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          artifact_metadata="$(
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+          )"
+          if [[ "$(jq -r '.workflow_run.head_branch // ""' <<<"$artifact_metadata")" != "main" ]]; then
+            echo "Refusing a baseline that was not produced from main." >&2
+            exit 1
+          fi
+
+          mkdir -p "${RUNNER_TEMP}/performance-baseline"
+          curl \
+            --fail \
+            --location \
+            --silent \
+            --show-error \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            --output "${RUNNER_TEMP}/performance-baseline.zip"
+          unzip -q \
+            "${RUNNER_TEMP}/performance-baseline.zip" \
+            -d "${RUNNER_TEMP}/performance-baseline"
+
+          baseline_path="$(find "${RUNNER_TEMP}/performance-baseline" -name performance.json -type f -print -quit)"
+          if [[ -z "$baseline_path" ]]; then
+            echo "Downloaded baseline artifact does not contain performance.json." >&2
+            exit 1
+          fi
+          cp "$baseline_path" "${RUNNER_TEMP}/baseline.json"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run stable benchmark
+        run: Scripts/ci/run-benchmarks.sh "${RUNNER_TEMP}/performance.json"
+
+      - name: Validate stable absolute gates
+        run: >-
+          Scripts/ci/validate-benchmarks.py
+          --profile stable
+          "${RUNNER_TEMP}/performance.json"
+
+      - name: Enforce regression threshold
+        if: steps.baseline.outputs.available == 'true'
+        run: |
+          Scripts/ci/compare-benchmarks.py \
+            "${RUNNER_TEMP}/baseline.json" \
+            "${RUNNER_TEMP}/performance.json" \
+            --default-threshold 10
+
+      - name: Record baseline bootstrap
+        if: steps.baseline.outputs.available != 'true'
+        run: |
+          echo "::notice::No unexpired stable baseline exists; this successful run will establish it."
+
+      - name: Upload stable diagnostic data
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-stable-${{ github.run_id }}
+          path: ${{ runner.temp }}/performance.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+      - name: Upload next stable baseline
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: performance-baseline
+          path: ${{ runner.temp }}/performance.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 90

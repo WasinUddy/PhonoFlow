@@ -1,0 +1,31 @@
+{
+  "configurations" : [
+    {
+      "id" : "7E8B992B-C354-4F44-96D8-9122549261EC",
+      "name" : "CI",
+      "options" : {
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : true,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:PhonoFlow.xcodeproj",
+      "identifier" : "081D97BA2F74DC85003C5872",
+      "name" : "PhonoFlow"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : true,
+      "skippedTests" : [
+      ],
+      "target" : {
+        "containerPath" : "container:PhonoFlow.xcodeproj",
+        "identifier" : "E10000000000000000000002",
+        "name" : "PhonoFlowTests"
+      }
+    }
+  ],
+  "version" : 1
+}

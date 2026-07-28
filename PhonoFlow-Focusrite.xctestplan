@@ -1,0 +1,34 @@
+{
+  "configurations" : [
+    {
+      "id" : "70DA04B0-DFFB-41C5-B25F-EC2CBD198C9A",
+      "name" : "Protected Focusrite Hardware",
+      "options" : {
+      }
+    }
+  ],
+  "defaultOptions" : {
+    "codeCoverage" : false,
+    "targetForVariableExpansion" : {
+      "containerPath" : "container:PhonoFlow.xcodeproj",
+      "identifier" : "081D97BA2F74DC85003C5872",
+      "name" : "PhonoFlow"
+    }
+  },
+  "testTargets" : [
+    {
+      "parallelizable" : false,
+      "selectedTests" : [
+        "FocusriteHardwareSoakTests/testFocusriteCaptureSoak()"
+      ],
+      "skippedTests" : [
+      ],
+      "target" : {
+        "containerPath" : "container:PhonoFlow.xcodeproj",
+        "identifier" : "E10000000000000000000002",
+        "name" : "PhonoFlowTests"
+      }
+    }
+  ],
+  "version" : 1
+}
