@@ -17,10 +17,10 @@
     "check": "npm run typecheck && npm run size && npm run test && npm run test:e2e:chromium"
   },
   "devDependencies": {
-    "@axe-core/playwright": "4.12.1",
-    "@playwright/test": "1.61.1",
+    "@axe-core/playwright": "4.13.0",
+    "@playwright/test": "1.62.1",
     "@vitest/coverage-v8": "4.1.10",
-    "happy-dom": "20.11.1",
+    "happy-dom": "20.14.0",
     "vitest": "4.1.10"
   }
 }
