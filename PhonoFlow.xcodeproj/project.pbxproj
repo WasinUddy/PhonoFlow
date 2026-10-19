@@ -663,7 +663,7 @@
 			repositoryURL = "https://github.com/hummingbird-project/hummingbird.git";
 			requirement = {
 				kind = exactVersion;
-				version = 2.25.1;
+				version = 2.28.0;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
